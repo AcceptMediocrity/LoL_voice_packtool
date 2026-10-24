@@ -11,7 +11,10 @@
 //!   exe 旁边直接就有 src\ 与 runtime\。
 #![windows_subsystem = "windows"]
 
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::process::CommandExt;
+use std::process::Stdio;
 use std::path::{Path, PathBuf};
 
 /// CREATE_NO_WINDOW: 不留控制台窗口
@@ -66,6 +69,39 @@ fn show_our_window() -> bool {
     true
 }
 
+/// 启动日志: %LOCALAPPDATA%\LoL_Voice\startup.log
+///
+/// 以前启动器把 node 的 stdout/stderr 全丢掉, 用户报"闪退"时拿不到任何线索。
+fn startup_log() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let dir = PathBuf::from(base).join("LoL_Voice");
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("startup.log"))
+}
+
+/// 读日志尾部(最多 max 字节), 用来弹给用户看。
+fn read_tail(path: &Path, max: u64) -> String {
+    let mut file = match File::open(path) {
+        Ok(handle) => handle,
+        Err(_) => return String::from("(日志为空)"),
+    };
+    let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let start = size.saturating_sub(max);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::from("(日志读取失败)");
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return String::from("(日志读取失败)");
+    }
+    let text = String::from_utf8_lossy(&buf).to_string();
+    // 截断点可能切在多字节字符中间, 去掉开头的乱码行
+    match text.find('\n') {
+        Some(index) if start > 0 => text[index + 1..].trim().to_string(),
+        _ => text.trim().to_string(),
+    }
+}
+
 /// 程序本体在哪: 优先 exe 旁边的 resource\, 否则就用 exe 自己的目录。
 fn resolve_root(exe_dir: &Path) -> PathBuf {
     let nested = exe_dir.join("resource");
@@ -104,6 +140,30 @@ fn main() {
         return;
     }
 
+    // 输出重定向到日志: 用户闪退时, 这份文件是唯一能说明原因的东西
+    let log_path = startup_log();
+    let mut log_handle = log_path.as_ref().and_then(|p| {
+        OpenOptions::new().create(true).write(true).truncate(true).open(p).ok()
+    });
+    if let Some(handle) = log_handle.as_mut() {
+        let _ = writeln!(
+            handle,
+            "--- LoL Voice 启动 ---\n程序目录: {}\nNode: {}\n入口: {}",
+            root.display(),
+            node.display(),
+            app.display()
+        );
+        let _ = handle.flush();
+    }
+    let out_stdio = match log_handle.as_ref().and_then(|h| h.try_clone().ok()) {
+        Some(clone) => Stdio::from(clone),
+        None => Stdio::null(),
+    };
+    let err_stdio = match log_handle.as_ref().and_then(|h| h.try_clone().ok()) {
+        Some(clone) => Stdio::from(clone),
+        None => Stdio::null(),
+    };
+
     // 限制 V8 堆上限: 默认上限是按机器内存算的(可以很大), 这个程序根本用不到,
     // 限住之后 GC 更早回收, 常驻内存更可控。
     let started = std::process::Command::new(&node)
@@ -111,10 +171,50 @@ fn main() {
         .arg(&app)
         .current_dir(&root)
         .env("LEAGUE_VOICE_RELEASE", "1")
+        .stdin(Stdio::null())
+        .stdout(out_stdio)
+        .stderr(err_stdio)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
 
-    if let Err(error) = started {
-        alert(&format!("启动失败：{error}"));
+    let mut child = match started {
+        Ok(handle) => handle,
+        Err(error) => {
+            alert(&format!("启动失败：{error}"));
+            return;
+        }
+    };
+
+    // 盯 10 秒: 如果 node 这么快就退出, 说明是启动失败(缺文件/端口被占/报错),
+    // 必须让用户看到原因, 而不是"双击闪一下就没了"。
+    let mut early_exit: Option<i32> = None;
+    for _ in 0..50 {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                early_exit = Some(status.code().unwrap_or(-1));
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(_) => break,
+        }
+    }
+
+    if let Some(code) = early_exit {
+        let tail = log_path
+            .as_ref()
+            .map(|path| read_tail(path, 1400))
+            .unwrap_or_else(|| String::from("(没有日志)"));
+        // 正常退出(用户开了一下就关)不该弹错误框: 只要走到"HTTP 服务已启动"且退出码为 0 就算正常
+        let served = tail.contains("HTTP 服务已启动");
+        if code == 0 && served {
+            return;
+        }
+        let where_log = log_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| String::from("(未生成)"));
+        alert(&format!(
+            "程序启动后立刻退出了(退出码 {code})。\n\n最近日志:\n{tail}\n\n日志文件:\n{where_log}\n\n把上面的日志发给我就能定位问题。"
+        ));
     }
 }

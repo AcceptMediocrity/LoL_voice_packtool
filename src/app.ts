@@ -121,6 +121,27 @@ function openAppWindow(browser: string, url: string): ChildProcess {
  * 标题栏由页面自己画。编译产物在 desktop/target/release/voice-shell.exe,
  * 没有就回退到浏览器 --app 模式(功能一样, 只是多一条浏览器的标题栏)。
  */
+/**
+ * 本机有没有 WebView2 运行时。
+ *
+ * 原生外壳是 wry/WebView2 做的: 系统里没有运行时, voice-shell.exe 会**秒退**,
+ * 用户看到的就是"双击闪一下就没了"。Win10 LTSC / 精简版 / 部分 N 版都没有预装。
+ */
+function hasWebView2(): boolean {
+  const pf86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+  const pf = process.env["ProgramFiles"] ?? "C:\\Program Files";
+  for (const root of [path.join(pf86, "Microsoft", "EdgeWebView", "Application"), path.join(pf, "Microsoft", "EdgeWebView", "Application")]) {
+    try {
+      for (const dir of fs.readdirSync(root)) {
+        if (fs.existsSync(path.join(root, dir, "msedgewebview2.exe"))) return true;
+      }
+    } catch {
+      /* 这个位置没装, 继续 */
+    }
+  }
+  return false;
+}
+
 function findShell(): string | null {
   if (process.platform !== "win32") return null;
   // 发布包把外壳放在 desktop/voice-shell.exe; 开发目录里是 cargo 的产物
@@ -173,6 +194,14 @@ async function main(): Promise<void> {
   const releaseMode = hasFlag("release") || process.env.LEAGUE_VOICE_RELEASE === "1";
   if (releaseMode) {
     setLogLevel("warn" as LogLevel);
+    // 发布包也留一份日志: 用户报"闪退"时, 这份文件就是唯一的线索
+    try {
+      const dir = path.join(process.env["LOCALAPPDATA"] ?? appRoot(), "LoL_Voice");
+      fs.mkdirSync(dir, { recursive: true });
+      setLogFile(path.join(dir, "app.log"));
+    } catch {
+      /* 目录不可写就只走控制台 */
+    }
   } else {
     // 应用模式下把日志落盘, 排障时可直接查看(窗口是独立进程, 控制台输出容易丢)
     setLogFile(path.join(appRoot(), ".tmp", "app.log"));
@@ -209,7 +238,10 @@ async function main(): Promise<void> {
   }
 
   // 优先用原生外壳(无边框窗口); 加 --browser-window 可强制用浏览器
-  const shell = hasFlag("browser-window") ? null : findShell();
+  // 没有 WebView2 就别用原生外壳了: 它必然秒退, 表现为"打开了但界面不出现"
+  const webview2 = hasWebView2();
+  if (!webview2) logger.warn("未检测到 WebView2 运行时, 改用浏览器窗口(装 WebView2 后可恢复无边框窗口)");
+  const shell = hasFlag("browser-window") || !webview2 ? null : findShell();
   const browser = shell ? null : findChromium();
   if (!shell && !browser) {
     console.log("[!] 未找到 Edge/Chrome，改用系统默认浏览器打开；关闭本窗口即退出。");
@@ -232,29 +264,71 @@ async function main(): Promise<void> {
     return;
   }
 
-  await new Promise<void>((resolve) => {
-    const finish = (reason: string) => {
-      logger.info(`窗口已关闭(${reason})，正在停止服务…`);
-      resolve();
-    };
-    windowProcess.on("exit", () => finish("window-closed"));
-    windowProcess.on("error", (error) => {
-      logger.warn(`窗口进程异常: ${error.message}`);
-      finish("error");
+  /** 等窗口进程结束; 外壳在 4 秒内就退出时判定为"启动失败"而不是"用户关窗"。 */
+  const waitWindow = (proc: ChildProcess, isShell: boolean): Promise<"closed" | "failed"> =>
+    new Promise((resolve) => {
+      const startedAt = Date.now();
+      proc.on("exit", (code) => {
+        if (isShell && Date.now() - startedAt < 4000) {
+          logger.warn(`原生外壳 ${Date.now() - startedAt}ms 就退出了(exit=${code}), 判定为启动失败`);
+          resolve("failed");
+          return;
+        }
+        logger.info(`窗口已关闭(exit=${code})，正在停止服务…`);
+        resolve("closed");
+      });
+      proc.on("error", (error) => {
+        logger.warn(`窗口进程异常: ${error.message}`);
+        resolve(isShell ? "failed" : "closed");
+      });
     });
-    process.on("SIGINT", () => {
+
+  const stopOnSignal = () => {
+    try {
+      windowProcess.kill();
+    } catch {
+      /* ignore */
+    }
+  };
+  process.on("SIGINT", stopOnSignal);
+
+  let outcome = await waitWindow(windowProcess, Boolean(shell));
+  if (outcome === "failed") {
+    // 外壳死了(最常见是 WebView2 缺失/被杀软拦截/显卡驱动崩), 退回浏览器窗口,
+    // 至少让用户看到界面, 而不是"闪一下就没了"。
+    const fallbackBrowser = findChromium();
+    logger.warn("原生外壳启动失败, 改用浏览器窗口继续运行");
+    if (fallbackBrowser) {
       try {
-        windowProcess.kill();
-      } catch {
-        /* ignore */
+        windowProcess = openAppWindow(fallbackBrowser, url);
+        outcome = await waitWindow(windowProcess, false);
+      } catch (error) {
+        logger.warn(`浏览器窗口也打不开: ${String((error as Error).message ?? error)}`);
+        openDefaultBrowser(url);
+        await waitForever();
+        outcome = "closed";
       }
-      finish("sigint");
-    });
-  });
+    } else {
+      openDefaultBrowser(url);
+      await waitForever();
+      outcome = "closed";
+    }
+  }
+  process.off("SIGINT", stopOnSignal);
 
   await cleanupOnExit();
   await running.close();
   console.log("[*] 已退出。");
 }
+
+process.on("uncaughtException", (error) => {
+  logger.error(`未捕获异常, 即将退出: ${error?.stack ?? String(error)}`);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  const detail = reason instanceof Error ? reason.stack : String(reason);
+  logger.error(`未处理的 Promise 拒绝, 即将退出: ${detail}`);
+  process.exit(1);
+});
 
 await main();
