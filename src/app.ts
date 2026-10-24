@@ -207,6 +207,18 @@ async function main(): Promise<void> {
     setLogFile(path.join(appRoot(), ".tmp", "app.log"));
   }
 
+  // 安装目录不可写(最常见的坑: 解压到 C:\Program Files)会让配置、语音包、日志全部写不进去,
+  // 用户看到的就是"点了没反应"或者启动直接失败。这里启动时先探一次, 早发现早提示。
+  try {
+    const probe = path.join(appRoot(), ".write-probe");
+    fs.writeFileSync(probe, "ok");
+    fs.rmSync(probe, { force: true });
+  } catch (error) {
+    const hint = "安装目录不可写（可能放进了 C:\\Program Files）。请把整个文件夹移到 D 盘或桌面再运行。";
+    logger.error(hint + " 具体错误: " + String((error as Error).message ?? error));
+    console.error("[!] " + hint);
+  }
+
   let running;
   try {
     running = (await startApiServer({ host, port })).running;

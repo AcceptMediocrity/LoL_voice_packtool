@@ -595,6 +595,15 @@
     while (status === "running" || status === "pending") {
       await new Promise((resolve) => setTimeout(resolve, 350));
       const payload = await api("/api/tasks/" + id);
+      // 任务可能已经失效(程序中途重启过/任务被清掉): 以前这里会抛
+      // "Cannot read properties of undefined (reading 'status')", 现在给一句人能看懂的话。
+      if (!payload || !payload.task) {
+        log("任务已失效（程序可能重启过），请重新点击开启");
+        setStatus("任务已失效，请重新点击开启", "err", 0);
+        store.taskId = null;
+        setBusy(false);
+        return "failed";
+      }
       status = payload.task.status;
       if (status === "running") continue;
 
@@ -617,6 +626,18 @@
     return status;
   }
 
+  /**
+   * 后端在不满足条件时会返回 { ok: false, message }(比如"英雄联盟未启动"), 此时没有 task。
+   * 以前这里直接读 payload.task.id, 页面上就只剩一句
+   * "Cannot read properties of undefined (reading 'id')", 真正的原因被吞掉。
+   */
+  function requireTaskId(payload) {
+    const id = payload && payload.task && payload.task.id;
+    if (typeof id === "string" && id) return id;
+    const reason = (payload && (payload.message || payload.error)) || "后端没有返回任务";
+    throw new Error(reason);
+  }
+
   async function startTask(label, request) {
     if (store.busy) {
       setStatus("已有任务正在执行，请稍候…", "err");
@@ -634,7 +655,7 @@
       }
       if (!preferencesReady || preferencesDirty) throw new Error("配置尚未保存成功，请先重试保存配置。");
       const payload = await request();
-      return await waitTask(payload.task.id);
+      return await waitTask(requireTaskId(payload));
     } catch (error) {
       log("错误：" + error.message);
       setStatus("错误：" + error.message, "err", 0);
@@ -899,10 +920,11 @@
         throw new Error((payload && payload.message) || "HTTP " + response.status);
       }
 
-      const status = await waitTask(payload.task.id);
+      const taskId = requireTaskId(payload);
+      const status = await waitTask(taskId);
       if (status !== "succeeded") return;
 
-      const detail = await api("/api/tasks/" + payload.task.id);
+      const detail = await api("/api/tasks/" + taskId);
       const result = detail.result || {};
       const code = result.code || "";
       await refresh();
