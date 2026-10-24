@@ -197,6 +197,16 @@ test("客户端未启动: 只有勾选选人语音才拦截(对局语音/语言�
     assert.equal(allowed.json.blocked, undefined, "纯对局模块不该被拦截");
     assert.equal(allowed.json.ok, true);
     if (allowed.json.task?.id) await waitTask(allowed.json.task.id);
+
+    // 选人语音 + 对局语音 -> 不再整体拦截, 而是跳过选人语音继续做 (用户实测:
+    // 勾着默认就有的选人语音时, 没开客户端连对局语音都开不了, 而且页面只剩一句 TypeError)
+    const mixed = await post("/api/apply", { locale: "ja_JP", restartClient: false, modules: ["lobby_voice", "ingame_voice"] });
+    assert.equal(mixed.json.blocked, undefined, "混合勾选不该整体拦截");
+    assert.equal(mixed.json.ok, true);
+    assert.match(String(mixed.json.warning ?? ""), /选人语音/, "必须告诉用户选人语音被跳过了");
+    assert.ok(mixed.json.task?.id, "必须照常返回任务");
+    const mixedDone = await waitTask(mixed.json.task.id);
+    assert.equal(mixedDone.task.status, "succeeded", JSON.stringify(mixedDone.result));
   } finally {
     setClientRunningOverride(async () => true);
   }

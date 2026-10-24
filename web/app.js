@@ -655,6 +655,11 @@
       }
       if (!preferencesReady || preferencesDirty) throw new Error("配置尚未保存成功，请先重试保存配置。");
       const payload = await request();
+      // 后端在"客户端没开、但仍然能继续"时会带一条 warning(比如跳过了选人语音)
+      if (payload && payload.warning) {
+        log("提示：" + payload.warning);
+        setStatus(payload.warning, "warn", 0);
+      }
       return await waitTask(requireTaskId(payload));
     } catch (error) {
       log("错误：" + error.message);

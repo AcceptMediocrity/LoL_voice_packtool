@@ -245,7 +245,7 @@ export function buildRouter(): Router {
     const body = asRecord(context.body);
     const config = await loadConfig();
     const locale = typeof body.locale === "string" && body.locale ? body.locale : config.defaultLocale;
-    const modules = Array.isArray(body.modules) ? asModules(body.modules) ?? [] : undefined;
+    let modules = Array.isArray(body.modules) ? asModules(body.modules) ?? [] : undefined;
     return { ok: true, plan: await planSwitch({ locale, modules }) };
   });
 
@@ -256,15 +256,25 @@ export function buildRouter(): Router {
     // 注意: asModules 会把空数组折成 undefined, 而 undefined 在这里的意思是"没指定, 全都要"。
     // 于是"只勾了客户端界面文字"会变成"顺手把对局语音/对局文字也切了" —— 用户实测踩到过。
     // 所以明确传了数组(哪怕是空的)就必须原样尊重。
-    const modules = Array.isArray(body.modules) ? asModules(body.modules) ?? [] : undefined;
+    let modules = Array.isArray(body.modules) ? asModules(body.modules) ?? [] : undefined;
     // 设计约定: 只有勾选了"选人语音"才要求客户端在运行(它必须连 LCU);
     // 对局语音/对局语言只改游戏文件, 客户端没开也能做。恢复原版不受任何限制。
+    //
+    // 这里**不整体拦截**: 以前客户端没开就直接返回 blocked, 用户勾着选人语音(默认就是勾着的)
+    // 时连"只改对局语音"都做不了, 界面上还只剩一句 TypeError。现在改成跳过它、其余照做。
+    let skippedClient = "";
     if (needsClient(modules) && !(await isClientRunning())) {
-      return {
-        ok: false,
-        blocked: true,
-        message: "英雄联盟未启动：选人语音需要客户端运行，请先启动客户端并登录到大厅"
-      };
+      const rest = (modules ?? []).filter((item) => item !== "lobby_voice" && item !== "lobby_lang");
+      if (rest.length === 0) {
+        return {
+          ok: false,
+          blocked: true,
+          message:
+            "英雄联盟未启动：只勾了选人语音，它需要客户端运行才能生效。请先启动客户端并登录到大厅；如果只想改对局语音，把『选人语音』的勾去掉即可。"
+        };
+      }
+      modules = rest;
+      skippedClient = "选人语音需要客户端运行，本次已跳过（对局语音/语言照常开启）";
     }
     // 客户端界面文字不是游戏模块: 它要装/卸注入器(各需要一次管理员授权), 所以在任务开始前
     // 先做掉 —— 这样任务后面那次"重启客户端"正好能让注入生效。
@@ -295,7 +305,7 @@ export function buildRouter(): Router {
       restartClient: typeof body.restartClient === "boolean" ? body.restartClient : undefined,
       lobbyLang: body.lobbyLang === "en_US" || body.lobbyLang === "zh_CN" ? body.lobbyLang : "keep"
     });
-    return { ok: true, task };
+    return skippedClient ? { ok: true, task, warning: skippedClient } : { ok: true, task };
   });
 
   /** 页面看到 window_show=true 就让外壳把窗口亮出来(读一次就清掉, 一次性)。 */
