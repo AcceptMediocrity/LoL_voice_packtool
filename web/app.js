@@ -546,7 +546,7 @@
     const on = Boolean(textPackState.active && textPackState.staged === locale);
 
     // 状态卡(与另外三格同款): 开了就点亮, 并写清目标语言与是否需要重启客户端
-    const names = { en_us: "英文", ja_jp: "日文", ko_kr: "韩文" };
+    const names = { en_us: "英文", ja_jp: "日文", ko_kr: "韩文", ru_ru: "俄文" };
     const card = $("cardStatusClientText");
     if (card) card.classList.toggle("active", on);
     const tag = $("tagStatusClientText");

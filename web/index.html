@@ -106,9 +106,10 @@
         <span class="check-text">对局前选人语音</span>
       </label>
 
-      <!-- 客户端界面文字: 语言跟着上面选的语音包走; 只改客户端, 不动局内 -->
+      <!-- 客户端界面文字: 语言跟着上面选的语音包走; 只改客户端, 不动局内
+           默认不勾 —— 它要装注入器(一次管理员授权), 默认勾着会让普通用户以为出了错。 -->
       <label class="check-pill">
-        <input type="checkbox" id="modClientText" checked />
+        <input type="checkbox" id="modClientText" />
         <span class="check-dot"></span>
         <span class="check-text">客户端界面文字</span>
       </label>
