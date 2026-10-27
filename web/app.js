@@ -105,7 +105,11 @@
     );
     const payload = await response.json().catch(() => null);
     if (!response.ok || (payload && payload.ok === false && payload.error)) {
-      throw new Error((payload && payload.message) || "HTTP " + response.status);
+      const error = new Error((payload && payload.message) || "HTTP " + response.status);
+      // 带上状态码/错误码: 409 busy 是"预期内的忙", 界面上不该当成崩溃来吓用户
+      error.status = response.status;
+      error.code = payload && payload.error;
+      throw error;
     }
     return payload;
   }
@@ -662,8 +666,15 @@
       }
       return await waitTask(requireTaskId(payload));
     } catch (error) {
-      log("错误：" + error.message);
-      setStatus("错误：" + error.message, "err", 0);
+      const busy = error && (error.status === 409 || error.code === "busy");
+      if (busy) {
+        // 双击/连点时的正常提示, 不是故障
+        log(error.message);
+        setStatus(error.message, "warn", 0);
+      } else {
+        log("错误：" + error.message);
+        setStatus("错误：" + error.message, "err", 0);
+      }
       setBusy(false);
       return "failed";
     }

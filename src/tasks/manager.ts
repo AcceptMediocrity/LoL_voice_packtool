@@ -5,6 +5,16 @@
 import { randomUUID } from "node:crypto";
 import { createLogger } from "../core/logger.ts";
 
+/** 互斥组里已有任务在跑: 这是"预期内的忙", 不是服务器故障, 所以自带 HTTP 状态码。 */
+export class TaskBusyError extends Error {
+  readonly status = 409;
+  readonly code = "busy";
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskBusyError";
+  }
+}
+
 const logger = createLogger("tasks");
 
 export type TaskKind =
@@ -175,7 +185,7 @@ export class TaskManager {
   ): { task: TaskSnapshot } {
     const group = EXCLUSIVE_GROUPS[kind];
     if (group && this.lockedGroups.has(group)) {
-      throw new Error(`已有任务在进行中(${this.tasks.get(this.lockedGroups.get(group)!)?.label ?? group})，请等待完成后再试。`);
+      throw new TaskBusyError(`已有任务在进行中(${this.tasks.get(this.lockedGroups.get(group)!)?.label ?? group})，请等待完成后再试。`);
     }
     const id = randomUUID();
     const controller = new AbortController();

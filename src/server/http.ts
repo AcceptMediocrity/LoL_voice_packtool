@@ -364,8 +364,14 @@ export async function startHttpServer(options: ServerOptions): Promise<RunningSe
         jsonResponse(res, 200, payload ?? { ok: true });
       } catch (error) {
         const message = String((error as Error).message ?? error);
-        logger.warn(`接口异常 ${req.method} ${url.pathname}: ${message}`);
-        if (!res.headersSent && !res.destroyed) jsonResponse(res, 500, { ok: false, error: "internal_error", message });
+        // 业务上"预期内"的拒绝(比如已有任务在跑)自带状态码, 不该记成服务器故障
+        const rawStatus = (error as { status?: unknown }).status;
+        const status = typeof rawStatus === "number" && rawStatus >= 400 && rawStatus < 600 ? rawStatus : 500;
+        const rawCode = (error as { code?: unknown }).code;
+        const code = typeof rawCode === "string" && rawCode ? rawCode : "internal_error";
+        if (status >= 500) logger.warn(`接口异常 ${req.method} ${url.pathname}: ${message}`);
+        else logger.info(`${req.method} ${url.pathname} 被拒绝(${status}): ${message}`);
+        if (!res.headersSent && !res.destroyed) jsonResponse(res, status, { ok: false, error: code, message });
         else if (!res.destroyed) res.destroy();
       } finally {
         // 上传的临时文件: 处理器若已把它移交给后台任务会先移走, 这里只清理残留

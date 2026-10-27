@@ -212,6 +212,22 @@ test("客户端未启动: 只有勾选选人语音才拦截(对局语音/语言�
   }
 });
 
+test("已有任务在跑时再点开启: 返回 409 + busy, 而不是 500 服务器错误", async () => {
+  // 第一次开启会真的起一个后台任务
+  const first = await post("/api/apply", { locale: "ja_JP", restartClient: false, modules: ["ingame_voice"] });
+  assert.equal(first.json.ok, true);
+  assert.ok(first.json.task?.id);
+
+  // 任务还在跑的时候再点一次: 以前会被当成服务器故障(500)
+  const second = await post("/api/apply", { locale: "ja_JP", restartClient: false, modules: ["ingame_voice"] });
+  assert.equal(second.status, 409, "忙是预期内状态, 不该是 500");
+  assert.equal(second.json.ok, false);
+  assert.equal(second.json.error, "busy");
+  assert.match(String(second.json.message), /已有任务在进行中/);
+
+  if (first.json.task?.id) await waitTask(first.json.task.id);
+});
+
 test("POST /api/restore 全部还原为官方默认", async () => {
   const { json } = await post("/api/restore", { restartClient: false, modules: ["lobby_lang", "ingame_voice", "ingame_lang"] });
   assert.equal(json.ok, true);
