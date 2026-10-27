@@ -10,7 +10,7 @@ import { backupPath, pathExists, replaceFile, targetDirState } from "../core/fsx
 import { makeResult, shortReason, slotMissingNote, SLOT_MISSING_REASON, type FailureItem, type ModuleResult } from "../core/result.ts";
 import type { ModuleId, ProgressReporter } from "../core/types.ts";
 import { localeDisplayName } from "../packs/locales.ts";
-import { targetFileName } from "../packs/wad.ts";
+import { availableSuffixes, buildSlotIndex, pickTargetSuffix, slotFileName, wadStem } from "../packs/wad.ts";
 
 export interface PlanGroup {
   name: string;
@@ -39,6 +39,10 @@ export async function applyPlan(
   /** 写完再读回比对大小的文件数: 证明"真的写进去了", 而不是只报告成功。 */
   let verified = 0;
   let done = 0;
+  /** 实际替换用到的槽位(和首选语种不一致时写进提示, 便于外服排障)。 */
+  const slotsUsed = new Set<string>();
+  /** 有多个语种槽位又对不上首选的资源名(外服多语种安装), 报给用户看。 */
+  const ambiguousSlots: string[] = [];
   let cancelled = false;
 
   options.progress?.(0, planTotal);
@@ -49,24 +53,39 @@ export async function applyPlan(
     if (!usable) {
       for (const src of group.sources) {
         done += 1;
-        failures.push({ file: targetFileName(src, suffix), reason: why });
-        options.progress?.(done, planTotal, targetFileName(src, suffix));
+        failures.push({ file: slotFileName(wadStem(src), suffix), reason: why });
+        options.progress?.(done, planTotal, slotFileName(wadStem(src), suffix));
       }
       continue;
     }
+    // 目录里的真实槽位建一次索引(外服可能是 en_GB / es_MX, 不等于客户端语种)
+    const index = await buildSlotIndex(group.destDir);
     for (const src of group.sources) {
       if (options.signal?.aborted) {
         cancelled = true;
         break;
       }
-      const dst = path.join(group.destDir, targetFileName(src, suffix));
+      const stem = wadStem(src);
+      const resolved = pickTargetSuffix(index, stem, suffix);
       done += 1;
       // 目标槽位必须是游戏里本来就有的(备份还在也算: 说明只是当前文件缺了, 可以补回)
-      if (!(await pathExists(dst)) && !(await pathExists(backupPath(dst)))) {
-        failures.push({ file: path.basename(dst), reason: SLOT_MISSING_REASON });
-        options.progress?.(done, planTotal, path.basename(dst));
-        continue;
+      let dstName = resolved === null ? slotFileName(stem, suffix) : slotFileName(stem, resolved);
+      let dst = path.join(group.destDir, dstName);
+      if (resolved === null) {
+        // 索引里没有, 再看一眼备份: 备份在说明槽位本来存在, 只是当前文件丢了
+        if (await pathExists(backupPath(dst))) {
+          // 保持首选槽位
+        } else {
+          const seen = availableSuffixes(index, stem);
+          if (seen.length > 1 && ambiguousSlots.length < 3) {
+            ambiguousSlots.push(`${stem}: ${seen.map((item) => item.replace(".wad.client", "")).join("/")}`);
+          }
+          failures.push({ file: dstName, reason: SLOT_MISSING_REASON });
+          options.progress?.(done, planTotal, dstName);
+          continue;
+        }
       }
+      if (resolved !== null && resolved !== suffix) slotsUsed.add(resolved);
       const [ok, reason] = await replaceFile(src, dst);
       if (ok) {
         success += 1;
@@ -103,8 +122,8 @@ export async function applyPlan(
       planned: planTotal,
       success,
       failed: 0,
-      message: `${options.description} ${success}/${planTotal} 已切换为 ${locName}${verified ? `（已读回校验 ${verified} 个）` : ""}`,
-      detail: { plan: planTotal, success, failed: 0, verified }
+      message: `${options.description} ${success}/${planTotal} 已切换为 ${locName}${verified ? `（已读回校验 ${verified} 个）` : ""}${slotsUsed.size ? `（实际槽位 ${[...slotsUsed].map((item) => item.replace(".wad.client", "")).join("/")}` : ""}`,
+      detail: { plan: planTotal, success, failed: 0, verified, slots: [...slotsUsed] }
     });
   }
   if (!failures.length) {
@@ -119,12 +138,16 @@ export async function applyPlan(
   }
   const reason = shortReason(failures);
   const note = slotMissingNote(failures);
+  // 多语种安装对不上首选槽位时, 把候选列出来 —— 用户一眼就能看出客户端语种该填什么
+  const ambiguousNote = ambiguousSlots.length
+    ? `；游戏内该文件有多个语种槽位（${ambiguousSlots.join("，")}），无法确定用哪个，请在配置里指定 baseLocale 或把客户端切成对应语种`
+    : "";
   return makeResult(module, false, {
     planned: planTotal,
     success,
     failed: failures.length,
     reason: `替换失败 ${failures.length} 个：${reason}`,
-    message: `${locName} 替换失败 ${failures.length} 个：${reason}${note}`,
+    message: `${locName} 替换失败 ${failures.length} 个：${reason}${note}${ambiguousNote}`,
     errors: failures.map((item) => `${item.file}: ${item.reason}`),
     detail: { plan: planTotal, success, failed: failures.length, verified }
   });

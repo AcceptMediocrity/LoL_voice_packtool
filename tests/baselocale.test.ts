@@ -171,17 +171,32 @@ async function makeFinalDirZh(dir: string): Promise<void> {
   await writeFile(path.join(dir, "Champions", "Ahri.zh_CN.wad.client"), "CN-Ahri");
 }
 
-test("目标槽位缺失时提示里带上客户端基准语种", async () => {
-  const root = await makeTempDir("baselocale-missing");
+test("单语种安装: 首选槽位不存在时按游戏里实际存在的槽位替换(并说明用了哪个)", async () => {
+  const root = await makeTempDir("baselocale-adapt");
   const voiceRoot = path.join(root, "voice");
   const finalDir = path.join(root, "Game", "DATA", "FINAL");
   await makePack(voiceRoot, "ja_JP", { champions: ["Ahri"], maps: [] });
   await writeFile(path.join(finalDir, "Champions", "Ahri.zh_CN.wad.client"), "CN-Ahri");
 
+  // 基准语种报成 en_US, 但游戏里只有 zh_CN 一个槽位 —— 无可争议, 就该写 zh_CN
   const result = await applyIngameVoice("ja_JP", { voiceRoot, finalDir, leagueDir: null, baseLocale: "en_US" });
-  assert.equal(result.ok, false);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.match(result.message, /zh_CN/, "必须告诉用户实际用的是哪个槽位, 不能静默");
+});
+
+test("多语种安装: 首选槽位对不上且存在多个语种时不乱猜, 报缺失并列出候选", async () => {
+  const root = await makeTempDir("baselocale-ambiguous");
+  const voiceRoot = path.join(root, "voice");
+  const finalDir = path.join(root, "Game", "DATA", "FINAL");
+  await makePack(voiceRoot, "ja_JP", { champions: ["Ahri"], maps: [] });
+  await writeFile(path.join(finalDir, "Champions", "Ahri.en_GB.wad.client"), "GB-Ahri");
+  await writeFile(path.join(finalDir, "Champions", "Ahri.fr_FR.wad.client"), "FR-Ahri");
+
+  const result = await applyIngameVoice("ja_JP", { voiceRoot, finalDir, leagueDir: null, baseLocale: "en_US" });
+  assert.equal(result.ok, false, "猜错槽位会静默写到别的语种, 比报错更难查");
   assert.match(result.reason, /目标槽位缺失/);
-  assert.match(result.message, /en_US/);
+  assert.match(result.message, /en_GB/, "必须把游戏里实际存在的槽位列出来");
+  assert.match(result.message, /fr_FR/);
 });
 
 test("多语种安装不能用文件数量覆盖客户端当前语种", async () => {
