@@ -315,9 +315,59 @@ export function backupPathFor(wadFile: string): string {
   return `${wadFile}.chosen_bak`;
 }
 
-/** 是否已被打过补丁(备份存在即视为可还原)。 */
+/**
+ * 备份旁边的补丁记录。
+ *
+ * 惨痛教训: 游戏更新会**整份替换** wad, 而我们那份 .chosen_bak 还是更新前的旧版本。
+ * 老的还原不带任何判断, 直接把旧备份盖回去 —— 游戏文件当场变成过期版本,
+ * WeGame / TenProtect 校验不过, 游戏直接启动不了。
+ *
+ * 所以每次打完补丁都记下"打完之后的文件大小"; 还原前先比对:
+ *   - 大小一致  -> 现在这个文件还是我们改的, 可以安全还原
+ *   - 大小不一致 -> 游戏已经更新过, 当前文件就是官方版本, 绝不能覆盖
+ */
+export interface PatchRecord {
+  originalSize: number;
+  patchedSize: number;
+  /** 打完补丁那一刻的文件修改时间(毫秒)。游戏更新会整份替换文件, 时间必然变化,
+   *  所以"大小 + 时间"一起比对, 比只看大小可靠得多(两者可能刚好一样)。 */
+  patchedMtimeMs?: number;
+  patchedAt: string;
+}
+
+export function recordPathFor(wadFile: string): string {
+  return `${backupPathFor(wadFile)}.json`;
+}
+
+export async function readPatchRecord(wadFile: string): Promise<PatchRecord | null> {
+  try {
+    const text = await fs.readFile(recordPathFor(wadFile), "utf8");
+    const parsed = JSON.parse(text) as PatchRecord;
+    if (typeof parsed?.patchedSize !== "number") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function writePatchRecord(wadFile: string, record: PatchRecord): Promise<void> {
+  try {
+    await fs.writeFile(recordPathFor(wadFile), JSON.stringify(record, null, 2), "utf8");
+  } catch (error) {
+    logger.warn(`写补丁记录失败(不影响补丁本身): ${String((error as Error).message ?? error)}`);
+  }
+}
+
+/** 是否已被打过补丁(备份存在, 且文件还是我们改完的那个大小)。 */
 export async function isWadPatched(wadFile: string): Promise<boolean> {
-  return isFile(backupPathFor(wadFile));
+  if (!(await isFile(backupPathFor(wadFile)))) return false;
+  const record = await readPatchRecord(wadFile);
+  if (!record) return true;
+  try {
+    return (await fs.stat(wadFile)).size === record.patchedSize;
+  } catch {
+    return false;
+  }
 }
 
 /** 读出某个条目的内容, 压缩的自动解开(字体、贴图等都在压缩条目里)。 */
@@ -352,8 +402,17 @@ export async function patchWadEntries(wadFile: string, items: PatchItem[]): Prom
   const tempFile = `${wadFile}.chosen_new`;
   const backup = backupPathFor(wadFile);
 
-  // 1) 备份(仅首次)
+  // 1) 备份(仅首次) —— 游戏若在上次打补丁之后更新过, 旧备份已经是过期版本, 必须丢掉重做,
+  //    否则以后还原会把过期文件盖回去, 直接把游戏搞到启动不了。
   let createdBackup = false;
+  if (await isFile(backup)) {
+    const previous = await readPatchRecord(wadFile);
+    if (previous && originalSize !== previous.patchedSize) {
+      logger.warn(`检测到游戏已更新, 丢弃过期备份: ${backup}`);
+      await removeQuietly(backup);
+      await removeQuietly(recordPathFor(wadFile));
+    }
+  }
   if (!(await isFile(backup))) {
     try {
       await fs.copyFile(wadFile, backup);
@@ -442,6 +501,18 @@ export async function patchWadEntries(wadFile: string, items: PatchItem[]): Prom
     return { ...result, ok: false, message: `写入资源包失败：${String((error as Error).message ?? error)}（原文件未受影响）` };
   }
 
+  // 记下"打完之后的文件大小": 还原时用它判断游戏有没有在后面更新过
+  let patchedSize = originalSize + result.bytesAppended;
+  let patchedMtimeMs: number | undefined;
+  try {
+    const stat = await fs.stat(wadFile);
+    patchedSize = stat.size;
+    patchedMtimeMs = Math.round(stat.mtimeMs);
+  } catch {
+    /* 拿不到就用推算值 */
+  }
+  await writePatchRecord(wadFile, { originalSize, patchedSize, patchedMtimeMs, patchedAt: new Date().toISOString() });
+
   logger.info(`已替换 ${result.patched} 个条目, 追加 ${result.bytesAppended} 字节 -> ${wadFile}`);
   return {
     ...result,
@@ -450,15 +521,57 @@ export async function patchWadEntries(wadFile: string, items: PatchItem[]): Prom
   };
 }
 
-/** 还原: 把备份整体写回。 */
+/** 还原: 把备份整体写回 —— 但**只在确认当前文件还是我们改过的那份**时才写。 */
 export async function restoreWad(wadFile: string): Promise<{ ok: boolean; message: string }> {
   const backup = backupPathFor(wadFile);
   if (!(await isFile(backup))) return { ok: true, message: "没有备份，无需还原" };
+
+  const record = await readPatchRecord(wadFile);
+  let currentSize: number | null = null;
+  try {
+    currentSize = (await fs.stat(wadFile)).size;
+  } catch {
+    currentSize = null;
+  }
+
+  // 关键保护: 游戏更新会整份替换 wad, 这时旧备份是过期版本, 盖回去会让游戏启动不了。
+  let currentMtimeMs: number | null = null;
+  try {
+    currentMtimeMs = Math.round((await fs.stat(wadFile)).mtimeMs);
+  } catch {
+    currentMtimeMs = null;
+  }
+  const sizeChanged = currentSize !== null && currentSize !== record?.patchedSize;
+  const mtimeChanged =
+    typeof record?.patchedMtimeMs === "number" && currentMtimeMs !== null && currentMtimeMs !== record.patchedMtimeMs;
+
+  if (record && (sizeChanged || mtimeChanged)) {
+    await removeQuietly(backup);
+    await removeQuietly(recordPathFor(wadFile));
+    logger.warn("游戏已更新, 当前文件不是我们改的那份, 跳过还原: " + wadFile);
+    return { ok: true, message: "游戏已更新，当前文件就是官方版本，已跳过还原（旧备份已作废，不会覆盖新文件）" };
+  }
+
+  // 老版本留下的备份没有记录: 无法证明当前文件还是我们改的, 一律不覆盖。
+  if (!record) {
+    const backupSize = (await fs.stat(backup)).size;
+    if (currentSize !== null && currentSize <= backupSize) {
+      await removeQuietly(backup);
+      return { ok: true, message: "当前文件已是原始大小，无需还原" };
+    }
+    logger.warn("旧版备份缺少校验记录, 跳过还原: " + wadFile);
+    return {
+      ok: true,
+      message:
+        "检测到旧版本备份（没有校验记录）。为避免把过期文件盖回去导致游戏无法启动，已跳过还原；重新点一次『开启语音包』再点还原即可安全还原。"
+    };
+  }
   const tempFile = `${wadFile}.chosen_new`;
   try {
     await fs.copyFile(backup, tempFile);
     await fs.rename(tempFile, wadFile);
     await removeQuietly(backup);
+    await removeQuietly(recordPathFor(wadFile));
     logger.info(`已还原资源包: ${wadFile}`);
     return { ok: true, message: "已还原客户端原始资源包" };
   } catch (error) {

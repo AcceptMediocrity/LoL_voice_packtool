@@ -31,6 +31,7 @@ import {
   readWad,
   readWadEntries,
   restoreWad,
+  recordPathFor,
   summarizeMagic
 } from "../src/packs/wadfile.ts";
 
@@ -176,6 +177,55 @@ test("还原: 写回备份并删除备份文件, 内容与原始文件一致", a
   // 再还原一次: 幂等
   const again = await restoreWad(file);
   assert.equal(again.ok, true);
+});
+
+
+test("还原: 游戏更新过就绝不能用过期备份覆盖, 直接跳过", async () => {
+  const root = await makeTempDir("wad-restore-stale");
+  const { file, original } = await writeWad(root, [OGG_A, OGG_B]);
+  await patchWadEntries(file, [{ index: 0, data: Buffer.from("my-patch") }]);
+  assert.equal(await isWadPatched(file), true);
+
+  // 模拟游戏打补丁: 整份替换成新版本(内容与大小都和备份不同)
+  const newOfficial = Buffer.concat([original, Buffer.from("GAME-UPDATE-2026-10-22")]);
+  await fs.writeFile(file, newOfficial);
+
+  const restored = await restoreWad(file);
+  assert.equal(restored.ok, true);
+  assert.match(restored.message, /游戏已更新|跳过还原/, "必须告诉用户跳过了");
+  assert.deepEqual(await fs.readFile(file), newOfficial, "旧备份绝不能盖回去 —— 盖了游戏就启动不了");
+  await assert.rejects(() => fs.stat(backupPathFor(file)), "过期备份应当被清掉");
+  assert.equal(await isWadPatched(file), false);
+});
+
+test("补丁: 游戏更新后旧备份作废, 再次打补丁重新备份当前官方文件", async () => {
+  const root = await makeTempDir("wad-stale-backup");
+  const { file, original } = await writeWad(root, [OGG_A, OGG_B]);
+  await patchWadEntries(file, [{ index: 0, data: Buffer.from("my-patch") }]);
+
+  const newOfficial = Buffer.concat([original, Buffer.from("GAME-UPDATE")]);
+  await fs.writeFile(file, newOfficial);
+
+  await patchWadEntries(file, [{ index: 0, data: Buffer.from("patch-after-update") }]);
+  assert.deepEqual(await fs.readFile(backupPathFor(file)), newOfficial, "必须备份更新后的官方文件, 而不是旧文件");
+
+  const restored = await restoreWad(file);
+  assert.equal(restored.ok, true);
+  assert.deepEqual(await fs.readFile(file), newOfficial, "还原回到的是当前官方版本");
+});
+
+test("还原: 没有校验记录的旧备份不覆盖文件(宁可跳过也不写过期数据)", async () => {
+  const root = await makeTempDir("wad-legacy-backup");
+  const { file } = await writeWad(root, [OGG_A, OGG_B]);
+  await patchWadEntries(file, [{ index: 0, data: Buffer.from("my-patch") }]);
+  // 模拟老版本留下的备份: 没有 .json 记录
+  await fs.rm(recordPathFor(file), { force: true });
+
+  const before = await fs.readFile(file);
+  const restored = await restoreWad(file);
+  assert.equal(restored.ok, true);
+  assert.match(restored.message, /旧版本备份|跳过/, "旧备份必须给出说明");
+  assert.deepEqual(await fs.readFile(file), before, "无法确认时必须保持文件不动");
 });
 
 test("补丁: [+24] 默认重算为 xxh3_64(新数据), 显式给了 checksum 就用给的", async () => {
