@@ -4,6 +4,7 @@
  * 为什么先预检槽位: 游戏里本来就没有的 .zh_CN 文件, 新建出来也不会被加载,
  * 直接算"替换成功"会让用户以为生效了。这类记为"目标槽位缺失"。
  */
+import fs from "node:fs/promises";
 import path from "node:path";
 import { backupPath, pathExists, replaceFile, targetDirState } from "../core/fsx.ts";
 import { makeResult, shortReason, slotMissingNote, SLOT_MISSING_REASON, type FailureItem, type ModuleResult } from "../core/result.ts";
@@ -35,6 +36,8 @@ export async function applyPlan(
   const planTotal = groups.reduce((sum, group) => sum + group.sources.length, 0);
   const failures: FailureItem[] = [];
   let success = 0;
+  /** 写完再读回比对大小的文件数: 证明"真的写进去了", 而不是只报告成功。 */
+  let verified = 0;
   let done = 0;
   let cancelled = false;
 
@@ -65,8 +68,19 @@ export async function applyPlan(
         continue;
       }
       const [ok, reason] = await replaceFile(src, dst);
-      if (ok) success += 1;
-      else failures.push({ file: path.basename(dst), reason });
+      if (ok) {
+        success += 1;
+        // 读回校验: 目标文件大小必须和源包一致, 否则等于没换成
+        try {
+          const [srcSize, dstSize] = await Promise.all([fs.stat(src), fs.stat(dst)]);
+          if (srcSize.size === dstSize.size) verified += 1;
+          else failures.push({ file: path.basename(dst), reason: "写入后大小不一致" });
+        } catch {
+          /* 读不到就只记成功, 不额外报错 */
+        }
+      } else {
+        failures.push({ file: path.basename(dst), reason });
+      }
       options.progress?.(done, planTotal, path.basename(dst));
     }
     if (cancelled) break;
@@ -89,8 +103,8 @@ export async function applyPlan(
       planned: planTotal,
       success,
       failed: 0,
-      message: `${options.description} ${success}/${planTotal} 已切换为 ${locName}`,
-      detail: { plan: planTotal, success, failed: 0 }
+      message: `${options.description} ${success}/${planTotal} 已切换为 ${locName}${verified ? `（已读回校验 ${verified} 个）` : ""}`,
+      detail: { plan: planTotal, success, failed: 0, verified }
     });
   }
   if (!failures.length) {
@@ -112,6 +126,6 @@ export async function applyPlan(
     reason: `替换失败 ${failures.length} 个：${reason}`,
     message: `${locName} 替换失败 ${failures.length} 个：${reason}${note}`,
     errors: failures.map((item) => `${item.file}: ${item.reason}`),
-    detail: { plan: planTotal, success, failed: failures.length }
+    detail: { plan: planTotal, success, failed: failures.length, verified }
   });
 }

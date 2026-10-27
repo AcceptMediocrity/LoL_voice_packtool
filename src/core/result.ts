@@ -115,5 +115,5 @@ export function slotMissingNote(failures: FailureItem[]): string {
   const names = failures.filter((item) => item.reason === SLOT_MISSING_REASON).map((item) => item.file);
   if (!names.length) return "";
   const sample = names.slice(0, 3).join("、");
-  return `（游戏内没有对应的国服文件：${sample}${names.length > 3 ? " 等" : ""}，新建文件不会被加载）`;
+  return `（游戏内没有对应的目标文件：${sample}${names.length > 3 ? " 等" : ""}，新建文件不会被加载）`;
 }
