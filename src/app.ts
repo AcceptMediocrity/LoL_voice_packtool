@@ -21,6 +21,25 @@ const logger = createLogger("app");
  *   2. 把客户端"播放选择语音/播放禁用语音"两栏还原成开启(选人期间才由工具静音)
  *   3. 清掉 ui.lastApplied —— 下次打开显示"未开启", 也不会自己开起来
  */
+
+/**
+ * 启动自检: 如果注册表里还挂着加载器激活项, 但当前两个功能都没开, 就把它撤掉。
+ * 外服用户的典型症状是"客户端打不开, 只剩一个修复按钮"—— 根因就是这条激活项没撤干净。
+ */
+async function healStaleLoader(reason: string): Promise<void> {
+  try {
+    const [{ rollbackLoaderIfIdle }, { lobbyVoiceEnabled }] = await Promise.all([
+      import("./textpack/deploy.ts"),
+      import("./modules/lobbyVoice.ts")
+    ]);
+    const result = await rollbackLoaderIfIdle(reason, () => lobbyVoiceEnabled());
+    if (result.rolledBack) logger.warn(result.message);
+    else logger.info(`加载器检查(${reason}): ${result.message}`);
+  } catch (error) {
+    logger.warn(`加载器检查失败(${reason}): ${String((error as Error).message ?? error)}`);
+  }
+}
+
 async function cleanupOnExit(): Promise<void> {
   try {
     const { setClientOriginalVoice } = await import("./modules/clientVoice.ts");
@@ -28,6 +47,9 @@ async function cleanupOnExit(): Promise<void> {
   } catch (error) {
     logger.warn(`退出清理: 还原客户端原版台词失败(${String((error as Error).message ?? error)})`);
   }
+  // 关掉软件 = 回到原版: 加载器激活项也必须一起撤掉, 否则客户端下次起不来
+  await healStaleLoader("退出清理");
+
   try {
     const config = await loadConfig();
     if (config.ui?.lastApplied) {
@@ -218,6 +240,8 @@ async function main(): Promise<void> {
     logger.error(hint + " 具体错误: " + String((error as Error).message ?? error));
     console.error("[!] " + hint);
   }
+
+  await healStaleLoader("启动自检");
 
   let running;
   try {

@@ -286,6 +286,19 @@ export function startRestoreTask(request: RestoreRequest = {}): TaskSnapshot {
       clientText: request.clientText === true, restartClient: request.restartClient ?? appConfig.autoRestartClient,
       progress: handle.progress, signal: handle.signal
     });
+    // 还原完再检查加载器: 顺序很关键 —— 必须等选人语音真的关掉之后再判断,
+    // 否则会因为"选人语音还在用"而把激活项留下, 客户端(尤其外服)下次就启动不了。
+    try {
+      const [{ rollbackLoaderIfIdle }, { lobbyVoiceEnabled }] = await Promise.all([
+        import("./textpack/deploy.ts"),
+        import("./modules/lobbyVoice.ts")
+      ]);
+      const rolled = await rollbackLoaderIfIdle("恢复原版", () => lobbyVoiceEnabled());
+      if (rolled.rolledBack) logger.warn(rolled.message);
+    } catch (error) {
+      logger.warn(`恢复原版: 检查加载器失败 ${String((error as Error).message ?? error)}`);
+    }
+
     // 还原成功就把"上次开启"记录清掉(否则界面会显示一个已经失效的状态)
     if (result.ok) {
       try {

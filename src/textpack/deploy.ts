@@ -327,10 +327,49 @@ export async function mergeCollected(list: string[]): Promise<number> {
   return known.size - before;
 }
 
+
+/**
+ * 兜底回滚: 注册表里还挂着加载器激活项, 但两个功能都不再需要它时, 把它撤掉。
+ *
+ * 为什么必须有这条路径: "恢复原版"里的卸载只在 `textPack.staged` 为真时才执行。
+ * 只开过**选人语音**的用户(选人语音自己也会提权装加载器)staged 是 false, 卸载整段被跳过,
+ * 于是 `LeagueClientUx.exe` 的 Debugger 一直指着 core.dll。外服的 core.dll 注入大概率失败,
+ * 客户端进程就再也起不来 —— Riot Client 只会给一个「修复」按钮。这条兜底专门救这类机器。
+ */
+export async function rollbackLoaderIfIdle(
+  reason: string,
+  extraInUse?: () => Promise<boolean>
+): Promise<{ rolledBack: boolean; message: string }> {
+  let registry: "set" | "missing" | "unknown";
+  try {
+    registry = await readRegistry();
+  } catch {
+    return { rolledBack: false, message: "读取激活项失败, 跳过回滚" };
+  }
+  if (registry !== "set") return { rolledBack: false, message: "加载器本来就没激活" };
+
+  const staged = ((await fs.readFile(path.join(loaderDir(), "locale.txt"), "utf8").catch(() => "")) || "").trim();
+  if (staged) return { rolledBack: false, message: "客户端界面文字还在用加载器, 保留激活项" };
+
+  if (extraInUse) {
+    const busy = await extraInUse().catch(() => false);
+    if (busy) return { rolledBack: false, message: "选人语音还在用加载器, 保留激活项" };
+  }
+
+  const result = await runElevated("uninstall");
+  if (result.ok) return { rolledBack: true, message: `已撤销加载器激活(${reason}), 客户端可以正常启动了` };
+  return { rolledBack: false, message: `撤销加载器失败(${reason}): ${result.message}` };
+}
+
 /** 重启客户端: 注入只发生在客户端启动时, 所以运行中开启后必须重启一次。 */
 export async function restartClient(): Promise<{ ok: boolean; message: string }> {
   const result = await killClientUx();
-  return { ok: result.ok, message: result.ok ? "已重启客户端（会重新登录一次）" : result.message };
+  return {
+    ok: result.ok,
+    message: result.ok
+      ? "已关闭客户端（注入只在启动时发生）。如果它没有自己重新打开，请手动点一次启动。"
+      : result.message
+  };
 }
 
 /** 用 UAC 执行我们生成的那个脚本(会弹一次系统授权框)。 */
