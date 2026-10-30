@@ -17,7 +17,10 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createLogger } from "../core/logger.ts";
 import { isClientRunning, killClientUx } from "../core/win/processes.ts";
+
+const logger = createLogger("textpack");
 
 /** 装到用户目录, 而不是软件目录 —— 软件可能装在只读位置。 */
 export function loaderDir(): string {
@@ -372,9 +375,39 @@ export async function restartClient(): Promise<{ ok: boolean; message: string }>
   };
 }
 
+
+/**
+ * 本机有没有 Riot Vanguard。
+ *
+ * Vanguard 会拦住"用调试器/注入方式启动客户端"这套做法(我们借用的 Pengu core.dll 正是这种),
+ * 装上之后表现不是报错, 而是 **LeagueClientUx.exe 起不来** —— Riot Client 只会给一个「修复」按钮。
+ * 所以一旦检测到 Vanguard, 就直接不装, 而不是装完把用户的客户端搞坏。
+ */
+export async function detectVanguard(): Promise<boolean> {
+  const roots = [
+    path.join(process.env["ProgramFiles"] ?? "C:\\Program Files", "Riot Vanguard"),
+    path.join(process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)", "Riot Vanguard")
+  ];
+  for (const root of roots) {
+    if (await exists(path.join(root, "vgc.exe"))) return true;
+  }
+  return new Promise((resolve) => {
+    const child = spawn("sc", ["query", "vgc"], { windowsHide: true });
+    let out = "";
+    child.stdout?.on("data", (chunk) => { out += String(chunk); });
+    child.on("error", () => resolve(false));
+    child.on("close", () => resolve(/RUNNING|STOPPED|START_PENDING/i.test(out) && !/FAILED\s+1060/i.test(out)));
+  });
+}
+
 /** 用 UAC 执行我们生成的那个脚本(会弹一次系统授权框)。 */
 export async function runElevated(script: "install" | "uninstall"): Promise<{ ok: boolean; message: string }> {
   if (elevationDisabled()) return { ok: true, message: `已跳过真实提权（测试环境，${script}）` };
+  // 装了 Vanguard 不等于一定拦: 它只保护受它管辖的客户端(国服 LoL 不受它管, 我们实测正常)。
+  // 所以这里只记一条警告, 不拒绝 —— 真正的保护是"起不来就自动回滚"(rollbackLoaderIfIdle)。
+  if (script === "install" && (await detectVanguard())) {
+    logger.warn("本机装有 Riot Vanguard: 若目标客户端受它保护, 注入可能导致客户端无法启动(软件会在下次启动时自动撤销)");
+  }
   const file = path.join(loaderDir(), script + ".cmd");
   if (!(await exists(file))) return { ok: false, message: "找不到脚本, 请先复制文件" };
   // 取消激活时如果本来就没激活, 不必弹 UAC
