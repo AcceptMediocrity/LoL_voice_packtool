@@ -55,7 +55,7 @@ export function isCollectable(text, dict, maxLength) {
  */
 export function createTextReplacer(options) {
   const opts = options || {};
-  const dict = opts.dict || {};
+  let dict = opts.dict || {};
   const patterns = opts.patterns || [];
   const collect = opts.collect !== false;
   // 收集上限: 太短的没意义, 太长的多半是聊天/公告。原来定 40, 但客户端的提示与说明
@@ -67,6 +67,8 @@ export function createTextReplacer(options) {
   const CJK = /[\u3400-\u9fff\u3000-\u303f\uff00-\uffef]/;
   const state = { on: true, replaced: 0, scanned: 0, failed: 0, error: "" };
   const written = new WeakMap();
+  /** 我们改过的每个文本节点 -> 原文/译文, 关闭文字功能时按它原样还原。 */
+  const marks = new Map();
   const pending = new Set();
   const collected = new Set();
   let scheduled = false;
@@ -91,7 +93,7 @@ export function createTextReplacer(options) {
    * 因此不会被客户端页面的安全策略拦掉(实测跨域 fetch 会被拦, 那份清单就丢了)。
    * 网络回传作为补充手段保留。
    */
-  const STORE_KEY = "text-replacer.collected";
+  const STORE_KEY = "chosen-voice.collected";
 
   function reportCollection() {
     if (reported) return;
@@ -151,6 +153,9 @@ export function createTextReplacer(options) {
     const result = translate(value, dict, patterns);
     if (result !== null) {
       if (result === value) return;
+      // 记下原文, 关闭文字功能时可以逐节点还原(不需要用户重启客户端)
+      const previous = marks.get(node);
+      if (!previous || previous.translated !== value) marks.set(node, { original: value, translated: result });
       written.set(node, result);
       try { node.nodeValue = result; state.replaced += 1; } catch (error) { state.failed += 1; }
       return;
@@ -161,6 +166,26 @@ export function createTextReplacer(options) {
         collected.add(core);
         saveCollection();
       }
+    }
+  }
+
+  /** 把改过的文字全部还原成原文(关闭"客户端界面文字"时调用)。 */
+  function revert() {
+    for (const [node, mark] of marks) {
+      try {
+        if (node.isConnected && node.nodeValue === mark.translated) node.nodeValue = mark.original;
+      } catch (error) { /* 节点已不可写就算了 */ }
+    }
+    marks.clear();
+    state.replaced = 0;
+  }
+
+  /** 换一份字典: 先还原再按新字典重新扫一遍(换语种不需要重载页面)。 */
+  function setDict(next) {
+    dict = next || {};
+    revert();
+    if (state.on) {
+      try { walk(document.body || document.documentElement, 0); } catch (error) { /* 忽略 */ }
     }
   }
 
@@ -275,6 +300,10 @@ export function createTextReplacer(options) {
     get on() { return state.on; },
     off() { state.on = false; return "off"; },
     on_() { state.on = true; state.error = ""; walk(document.body || document.documentElement, 0); return "on"; },
+    /** 换字典(会先还原旧译文)。 */
+    setDict(next) { setDict(next); return Object.keys(dict).length; },
+    /** 还原所有改过的文字(关闭"客户端界面文字"用)。 */
+    revert() { revert(); return "reverted"; },
     stats() { return { replaced: state.replaced, scanned: state.scanned, failed: state.failed, error: state.error, collected: collected.size }; },
     /** 导出"没翻译到"的中文清单(按出现次数无从统计, 按长度排序)。 */
     report: reportCollection,

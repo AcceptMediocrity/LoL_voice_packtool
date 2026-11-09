@@ -102,3 +102,32 @@ export async function waitForClientUp(timeoutMs = 60000, intervalMs = 1500): Pro
   }
   return false;
 }
+
+/**
+ * 等客户端**真正可用**: 进程在 + LCU 有响应。
+ *
+ * 只看进程不够: 注入不兼容时客户端会崩在启动阶段(或者卡在加载/被反作弊拦住),
+ * 进程可能短暂存在, 用户看到的却是"进不去"。这里拿不到响应就判定失败,
+ * 上层据此自动撤销注入, 不会留下一个起不来的客户端。
+ */
+export async function waitForClientHealthy(
+  timeoutMs = 90000,
+  intervalMs = 2000
+): Promise<{ ok: boolean; reason: string }> {
+  const deadline = Date.now() + timeoutMs;
+  let sawProcess = false;
+  while (Date.now() < deadline) {
+    if (await isClientRunning()) {
+      sawProcess = true;
+      const response = await lcuRequest("GET", "/riotclient/region-locale", { timeoutMs: 2500 });
+      if (response.status === 200) return { ok: true, reason: "" };
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return {
+    ok: false,
+    reason: sawProcess
+      ? "客户端进程在, 但一直连不上它的本地接口（可能卡在加载, 或被反作弊拦截）"
+      : "客户端进程没有起来（可能在启动阶段崩溃了）"
+  };
+}

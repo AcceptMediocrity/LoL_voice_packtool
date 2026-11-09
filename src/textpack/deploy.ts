@@ -1,37 +1,41 @@
 /**
- * 客户端界面文字翻译 —— 部署。
+ * 加载器(Pengu core.dll)的部署 + 客户端插件开关。
  *
- * 范围: 只作用于英雄联盟**客户端**界面。客户端是客户端, 局内是局内 ——
- * 本模块装的是"C++ 注入核心 + 一个 JS 插件", 只注入客户端的两个浏览器进程
- * (LeagueClientUx / LeagueClientUxRender), 与局内游戏无关。
+ * 范围: 只作用于英雄联盟**客户端**界面与大厅; 与局内游戏无关。
  *
  * 做什么:
- *   1. 把官方 core.dll(未修改) + 配置 + 选定的语言插件复制到本地目录(不需要管理员);
+ *   1. 把官方 core.dll(未修改)复制到本地目录(不需要管理员);
  *   2. 生成 install.cmd / uninstall.cmd(可读、可审计), 需要管理员时由界面触发 UAC 执行;
- *   3. 读取注册表判断是否已激活(读注册表不需要管理员)。
+ *   3. 读取注册表判断是否已激活(读注册表不需要管理员);
+ *   4. 文字/语音两个功能的状态都读**插件自己的 config.json**, 不再靠增删插件目录。
  *
  * 为什么发 core.dll 而不是整套 Pengu: 发行包里真正必需的只有这一个 455 KB 的文件,
  * 启动器(4 MB 的 WPF 界面)在游戏期间根本不需要运行。许可为 MIT, 原样收录并附声明。
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { assetDir, loaderDir, readDatastoreMap } from "../core/loader.ts";
+import { clearMountPoint } from "../core/fsx.ts";
 import { createLogger } from "../core/logger.ts";
 import { isClientRunning, killClientUx } from "../core/win/processes.ts";
+import {
+  CLIENT_PLUGIN_NAME,
+  LEGACY_PLUGIN_NAMES,
+  clientAssetsLink,
+  clientFeaturesInUse,
+  clientPluginDir,
+  isClientPluginStaged,
+  readClientConfig,
+  stageClientPlugin,
+  unmountVoiceAssets,
+  writeClientConfig,
+  writeLangDict
+} from "../packs/clientPlugin.ts";
 
 const logger = createLogger("textpack");
 
-/** 装到用户目录, 而不是软件目录 —— 软件可能装在只读位置。 */
-export function loaderDir(): string {
-  const base = process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
-  return path.join(base, "LoL_Voice", "loader");
-}
-
-/** 软件包内的资源目录(core.dll 与字典都在这里)。 */
-export function assetDir(): string {
-  return path.join(import.meta.dirname, "..", "..", "assets");
-}
+export { assetDir, loaderDir, readDatastoreMap };
 
 /**
  * 测试环境必须跳过提权。
@@ -51,76 +55,22 @@ export function debuggerValue(dir: string): string {
   return `rundll32 "${path.join(dir, "core.dll")}", #6000`;
 }
 
-/**
- * 加载器的 datastore 文件是**异或混淆**过的(源码 core/src/renderer/v8_datastore.cc 里
- * transform_data(): buffer[i] ^= key[i % len], key = "A5dgY6lz9fpG9kGNiH1mZ")。
- * 我们要读它, 就得照抄这个异或 —— 只读不写, 免得不小心抹掉别的插件的数据。
- */
-const DATASTORE_KEY = "A5dgY6lz9fpG9kGNiH1mZ";
-
-function transformData(buffer: Buffer): Buffer {
-  const out = Buffer.alloc(buffer.length);
-  for (let i = 0; i < buffer.length; i += 1) out[i] = buffer[i]! ^ DATASTORE_KEY.charCodeAt(i % DATASTORE_KEY.length);
-  return out;
-}
-
-/** 把加载器的 datastore 整个读出来(异或解密后是 JSON 对象)。 */
-export async function readDatastoreMap(): Promise<Record<string, string>> {
-  const file = path.join(loaderDir(), "datastore");
-  try {
-    const raw = transformData(await fs.readFile(file)).toString("utf8");
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const out: Record<string, string> = {};
-    for (const [key, value] of Object.entries(parsed)) {
-      if (typeof value === "string") out[key] = value;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
-/**
- * 从加载器的 datastore 文件里把插件交上来的"没翻到"清单取回来。
- * 文件形如 {"键": "值"}(异或混淆), 我们只取自己那把键。
- */
-export async function syncCollectedFromLoader(): Promise<number> {
-  const file = path.join(loaderDir(), "datastore");
-  let raw: string;
-  try {
-    raw = transformData(await fs.readFile(file)).toString("utf8");
-  } catch {
-    return 0;
-  }
-  try {
-    const map = JSON.parse(raw) as Record<string, unknown>;
-    const value = map["text-replacer.collected"];
-    if (typeof value !== "string") return 0;
-    const parsed = JSON.parse(value) as { collected?: unknown };
-    if (!Array.isArray(parsed.collected)) return 0;
-    const list = parsed.collected.filter((item): item is string => typeof item === "string");
-    return list.length ? await mergeCollected(list) : 0;
-  } catch {
-    return 0;
-  }
-}
-
 export interface TextPackState {
-  /** 可用的目标语言(来自 assets/textpack/<语言>/plugin/index.js)。 */
+  /** 可用的目标语言(来自 assets/textpack/<语言>/dict.json)。 */
   supported: string[];
-  /** 已装到本地的语言("" = 没装)。 */
+  /** 已配置的文字语言("" = 没开)。 */
   staged: string;
   /** 注册表激活项的状态。 */
   registry: "set" | "missing" | "unknown";
   /** 装好且已激活。 */
   active: boolean;
-  /** 英雄联盟客户端此刻是否在运行 —— 注入发生在客户端启动时, 所以运行中必须重启一次才生效。 */
+  /** 英雄联盟客户端此刻是否在运行 —— 注入发生在客户端启动时。 */
   clientRunning: boolean;
   dir: string;
   message: string;
 }
 
-/** 扫描随包分发的语言插件。 */
+/** 扫描随包分发的字典。 */
 export async function supportedLocales(): Promise<string[]> {
   const base = path.join(assetDir(), "textpack");
   try {
@@ -128,8 +78,8 @@ export async function supportedLocales(): Promise<string[]> {
     const found: string[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.name === "plugin") continue;
-      const plugin = path.join(base, entry.name, "plugin", "index.js");
-      if (await fs.stat(plugin).then(() => true).catch(() => false)) found.push(entry.name);
+      const dict = path.join(base, entry.name, "dict.json");
+      if (await fs.stat(dict).then(() => true).catch(() => false)) found.push(entry.name);
     }
     return found.sort();
   } catch {
@@ -141,7 +91,14 @@ export async function supportedLocales(): Promise<string[]> {
 export async function readRegistry(): Promise<"set" | "missing" | "unknown"> {
   if (elevationDisabled()) return "set";   // 测试环境: 不去读真实注册表
   return new Promise((resolve) => {
-    const child = spawn("reg", ["query", IFEO_KEY, "/v", "Debugger"], { windowsHide: true });
+    let child;
+    try {
+      child = spawn("reg", ["query", IFEO_KEY, "/v", "Debugger"], { windowsHide: true });
+    } catch {
+      // 受限环境(杀软/沙箱)里连进程都起不来: 当作"读不到", 不要抛到接口上
+      resolve("unknown");
+      return;
+    }
     let out = "";
     child.stdout?.on("data", (chunk) => { out += String(chunk); });
     child.on("error", () => resolve("unknown"));
@@ -157,32 +114,30 @@ async function exists(file: string): Promise<boolean> {
   return fs.stat(file).then(() => true).catch(() => false);
 }
 
+/** 文字功能当前状态(界面"客户端界面文字"卡片用)。 */
 export async function getState(): Promise<TextPackState> {
-  const dir = loaderDir();
   await syncCollectedFromLoader().catch(() => 0);   // 顺手把插件交上来的清单收下来
   const supported = await supportedLocales();
   const registry = await readRegistry();
-  let staged = "";
-  const marker = path.join(dir, "locale.txt");
-  if (await exists(path.join(dir, "core.dll"))) {
-    staged = ((await fs.readFile(marker, "utf8").catch(() => "")) || "").trim();
-  }
-  const active = registry === "set" && staged !== "";
+  const config = await readClientConfig();
+  const pluginReady = await isClientPluginStaged();
+  const staged = pluginReady && config.text.enabled ? config.text.locale : "";
+  const active = staged !== "" && registry === "set";
   const clientRunning = await isClientRunning();
   const message = active
     ? clientRunning
-      ? `已开启（目标语言 ${staged}）—— 客户端正在运行, 重启客户端后才会生效`
+      ? `已开启（目标语言 ${staged}）—— 客户端正在运行, 重启客户端后才会完全生效`
       : `已开启（目标语言 ${staged}）—— 下次启动客户端时生效`
-    : staged
-      ? "已复制文件, 但还没激活（需要管理员权限写一次注册表）"
+    : config.text.enabled && pluginReady
+      ? "已配置, 但还没激活（需要管理员权限写一次注册表）"
       : "未开启";
-  return { supported, staged, registry, active, clientRunning, dir, message };
+  return { supported, staged, registry, active, clientRunning, dir: loaderDir(), message };
 }
 
 /** 配置文件: 关掉它会往客户端追加的那批 Chromium 开关(含 --no-sandbox), 也不要热键。 */
 function configText(): string {
   return [
-    "# LoL Voice 客户端文字翻译 —— 使用官方 Pengu Loader 的 core.dll(未修改)",
+    "# LoL Voice 客户端插件 —— 使用官方 Pengu Loader 的 core.dll(未修改)",
     "# 关掉默认开启的 optimized_client: 它会向客户端追加一批 Chromium 开关(含 --no-sandbox),",
     "# 我们只借用「把插件注入页面」这一个能力, 不需要它改动客户端的启动方式。",
     "optimized_client=false",
@@ -198,10 +153,10 @@ function scripts(dir: string): { install: string; uninstall: string } {
     install: [
       "@echo off",
       "chcp 65001 >nul",
-      "rem 由 LoL Voice 生成: 只写一个注册表项, 让 core.dll 能在客户端启动时注入我们的文字插件",
+      "rem 由 LoL Voice 生成: 只写一个注册表项, 让 core.dll 能在客户端启动时注入我们的插件",
       `reg add "${key}" /v Debugger /t REG_SZ /d "${value}" /f`,
       "if errorlevel 1 (echo 激活失败 & exit /b 1)",
-      "echo 已开启客户端文字翻译（重启客户端后生效）",
+      "echo 已开启客户端插件（重启客户端后生效）",
       "exit /b 0",
       ""
     ].join("\r\n"),
@@ -210,7 +165,7 @@ function scripts(dir: string): { install: string; uninstall: string } {
       "chcp 65001 >nul",
       "rem 由 LoL Voice 生成: 删除激活项, 客户端恢复原样",
       `reg delete "${key}" /v Debugger /f`,
-      "echo 已关闭客户端文字翻译",
+      "echo 已关闭客户端插件",
       "exit /b 0",
       ""
     ].join("\r\n")
@@ -224,44 +179,30 @@ export interface StageResult {
   message: string;
 }
 
-/** 复制文件(不需要管理员)。真正的激活要另一个提权步骤。 */
+/** 复制加载器 + 单一客户端插件, 并把文字语言写成 locale(不需要管理员)。 */
 export async function stage(locale: string): Promise<StageResult> {
   const dir = loaderDir();
-  const source = path.join(assetDir(), "textpack", locale, "plugin", "index.js");
-  const core = path.join(assetDir(), "loader", "core.dll");
-  if (!(await exists(source))) return { ok: false, dir, locale, message: `没有 ${locale} 的语言插件` };
-  if (!(await exists(core))) return { ok: false, dir, locale, message: "软件包里的 core.dll 缺失" };
-  const locked: string[] = [];
-  /** 单个文件复制失败(最常见是被正在运行的客户端占用)时跳过, 不要整个流程失败。 */
-  async function put(from: string, to: string, label: string): Promise<void> {
-    try {
-      await fs.copyFile(from, to);
-    } catch (error) {
-      const code = String((error as NodeJS.ErrnoException).code ?? "");
-      if (code === "EBUSY" || code === "EPERM" || code === "EACCES") locked.push(label);
-      else throw error;
-    }
-  }
-  try {
-    await fs.mkdir(path.join(dir, "plugins", "text-replacer"), { recursive: true });
-    // 先放插件: 它才是"要更新的东西"; core.dll 只在客户端没开着时才可能被替换
-    await fs.writeFile(path.join(dir, "plugins", "text-replacer", "index.js"), await fs.readFile(source));
-    await put(core, path.join(dir, "core.dll"), "core.dll（客户端正在运行，已跳过）");
-    await fs.writeFile(path.join(dir, "config"), configText(), "utf8");
-    await fs.writeFile(path.join(dir, "locale.txt"), locale + "\n", "utf8");
-    const { install, uninstall } = scripts(dir);
-    await fs.writeFile(path.join(dir, "install.cmd"), install, "utf8");
-    await fs.writeFile(path.join(dir, "uninstall.cmd"), uninstall, "utf8");
-    const note = locked.length ? `（${locked.join("、")} 被占用，重启客户端后可再点一次）` : "";
-    return { ok: true, dir, locale, message: `文件已复制${note}，接着需要管理员权限激活一次` };
-  } catch (error) {
-    return { ok: false, dir, locale, message: `复制失败: ${String((error as Error).message).slice(0, 120)}` };
-  }
+  const code = String(locale || "").trim().toLowerCase();
+  const loader = await stageLoader();
+  if (!loader.ok) return { ok: false, dir, locale: code, message: loader.message };
+  const plugin = await stageClientPlugin({ textLocale: code });
+  if (!plugin.ok) return { ok: false, dir, locale: code, message: plugin.message };
+  const lang = await writeLangDict(code);
+  if (!lang.ok) return { ok: false, dir, locale: code, message: lang.message };
+  const written = await writeClientConfig({ text: { enabled: true, locale: code } });
+  if (!written.ok) return { ok: false, dir, locale: code, message: written.message };
+  const notes = [...loader.locked, ...plugin.locked];
+  return {
+    ok: true,
+    dir,
+    locale: code,
+    message: `文件已复制${notes.length ? `（${notes.join("、")}）` : ""}，接着需要管理员权限激活一次`
+  };
 }
 
 /**
- * 只部署**加载器本体**(core.dll + 激活脚本), 不放任何插件。
- * 选人语音插件用这条: 它和文字翻译共用同一个加载器, 谁先开都能用。
+ * 只部署**加载器本体**(core.dll + 激活脚本), 不放任何插件配置。
+ * 两个功能共用同一个加载器, 谁先开都能用。
  */
 export async function stageLoader(): Promise<{ ok: boolean; dir: string; message: string; locked: string[] }> {
   const dir = loaderDir();
@@ -288,16 +229,34 @@ export async function stageLoader(): Promise<{ ok: boolean; dir: string; message
 }
 
 /**
- * 只删我们自己放的文件; 目录里有别的东西就留着(绝不误删用户的文件)。
+ * 彻底移除我们放的文件(两个功能都不用时才调用)。
  *
- * keepLoader = true 时**不删 core.dll / 激活脚本**: 加载器是和"选人语音"共用的,
- * 只还原文字翻译却把加载器拆了, 选人语音的插件就再也注入不进去了(踩过这个坑)。
+ * keepLoader = true 时不删 core.dll / 激活脚本: 授权被取消时注册表还指着它,
+ * 删了客户端就起不来。插件目录里的 voice_assets 是目录联接, 必须先把联接拆掉
+ * (否则递归删除会删到用户的语音包)。
  */
 export async function unstage(options: { keepLoader?: boolean } = {}): Promise<{ ok: boolean; message: string }> {
   const dir = loaderDir();
   try {
-    await fs.rm(path.join(dir, "plugins", "text-replacer"), { recursive: true, force: true });
-    // 许可声明两个名字留着: 早先版本装过, 这里顺手清掉
+    const link = clientAssetsLink();
+    if (!(await clearMountPoint(link))) {
+      return { ok: false, message: "语音资源联接仍被占用，暂时无法移除插件（请先关闭客户端）" };
+    }
+    await fs.rm(clientPluginDir(), { recursive: true, force: true });
+    for (const legacy of LEGACY_PLUGIN_NAMES) {
+      await fs.rm(path.join(dir, "plugins", legacy), { recursive: true, force: true });
+    }
+    // 旧版插件目录里可能有指向用户语音包的联接: 先拆联接, 确认拆干净了再删目录,
+    // 否则递归删除会跟到目标目录里, 把用户的音频删掉。
+    for (const name of await fs.readdir(path.join(dir, "plugins")).catch(() => [] as string[])) {
+      if (!name.startsWith("_legacy_")) continue;
+      const legacyDir = path.join(dir, "plugins", name);
+      const legacyLink = path.join(legacyDir, "voice_assets");
+      await clearMountPoint(legacyLink).catch(() => false);
+      if (!(await fs.stat(legacyLink).then(() => true).catch(() => false))) {
+        await fs.rm(legacyDir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
     const names = options.keepLoader
       ? ["locale.txt", "LICENSE-pengu.txt", "NOTICE.txt"]
       : ["core.dll", "config", "locale.txt", "LICENSE-pengu.txt", "NOTICE.txt", "install.cmd", "uninstall.cmd"];
@@ -306,7 +265,11 @@ export async function unstage(options: { keepLoader?: boolean } = {}): Promise<{
     }
     // 目录空了就一起删掉, 做到"一键卸干净"; 父目录(LoL_Voice)绝对不动, 那里还有界面内核的运行目录
     const left = await fs.readdir(dir).catch(() => [] as string[]);
-    if (left.length === 0) await fs.rmdir(dir).catch(() => undefined);
+    const pluginsLeft = await fs.readdir(path.join(dir, "plugins")).catch(() => [] as string[]);
+    if (left.length === 0 || (left.length === 1 && left[0] === "plugins" && pluginsLeft.length === 0)) {
+      await fs.rmdir(path.join(dir, "plugins")).catch(() => undefined);
+      await fs.rmdir(dir).catch(() => undefined);
+    }
     return { ok: true, message: "已移除本地文件" };
   } catch (error) {
     return { ok: false, message: `移除失败: ${String((error as Error).message).slice(0, 120)}` };
@@ -330,14 +293,26 @@ export async function mergeCollected(list: string[]): Promise<number> {
   return known.size - before;
 }
 
+/** 从加载器的 datastore 文件里把插件交上来的"没翻到"清单取回来。 */
+export async function syncCollectedFromLoader(): Promise<number> {
+  try {
+    const map = await readDatastoreMap();
+    const value = map["chosen-voice.collected"];
+    if (typeof value !== "string") return 0;
+    const parsed = JSON.parse(value) as { collected?: unknown };
+    if (!Array.isArray(parsed.collected)) return 0;
+    const list = parsed.collected.filter((item): item is string => typeof item === "string");
+    return list.length ? await mergeCollected(list) : 0;
+  } catch {
+    return 0;
+  }
+}
 
 /**
- * 兜底回滚: 注册表里还挂着加载器激活项, 但两个功能都不再需要它时, 把它撤掉。
+ * 兜底回滚: 注册表里还挂着激活项, 但两个功能都不再需要它时, 把它撤掉。
  *
- * 为什么必须有这条路径: "恢复原版"里的卸载只在 `textPack.staged` 为真时才执行。
- * 只开过**选人语音**的用户(选人语音自己也会提权装加载器)staged 是 false, 卸载整段被跳过,
- * 于是 `LeagueClientUx.exe` 的 Debugger 一直指着 core.dll。外服的 core.dll 注入大概率失败,
- * 客户端进程就再也起不来 —— Riot Client 只会给一个「修复」按钮。这条兜底专门救这类机器。
+ * 为什么必须有这条路径: "恢复原版"里如果只按 staged 判断, 只开过选人语音的用户
+ * 会漏掉卸载, Debugger 一直指着 core.dll; 外服 core.dll 注入失败, 客户端就再也起不来。
  */
 export async function rollbackLoaderIfIdle(
   reason: string,
@@ -351,9 +326,8 @@ export async function rollbackLoaderIfIdle(
   }
   if (registry !== "set") return { rolledBack: false, message: "加载器本来就没激活" };
 
-  const staged = ((await fs.readFile(path.join(loaderDir(), "locale.txt"), "utf8").catch(() => "")) || "").trim();
-  if (staged) return { rolledBack: false, message: "客户端界面文字还在用加载器, 保留激活项" };
-
+  const inUse = await clientFeaturesInUse().catch(() => ({ voice: false, text: false }));
+  if (inUse.voice || inUse.text) return { rolledBack: false, message: "客户端插件还在用加载器, 保留激活项" };
   if (extraInUse) {
     const busy = await extraInUse().catch(() => false);
     if (busy) return { rolledBack: false, message: "选人语音还在用加载器, 保留激活项" };
@@ -375,13 +349,9 @@ export async function restartClient(): Promise<{ ok: boolean; message: string }>
   };
 }
 
-
 /**
  * 本机有没有 Riot Vanguard。
- *
- * Vanguard 会拦住"用调试器/注入方式启动客户端"这套做法(我们借用的 Pengu core.dll 正是这种),
- * 装上之后表现不是报错, 而是 **LeagueClientUx.exe 起不来** —— Riot Client 只会给一个「修复」按钮。
- * 所以一旦检测到 Vanguard, 就直接不装, 而不是装完把用户的客户端搞坏。
+ * Vanguard 会拦住"用调试器/注入方式启动客户端"这套做法, 表现是客户端起不来。
  */
 export async function detectVanguard(): Promise<boolean> {
   const roots = [
@@ -392,7 +362,13 @@ export async function detectVanguard(): Promise<boolean> {
     if (await exists(path.join(root, "vgc.exe"))) return true;
   }
   return new Promise((resolve) => {
-    const child = spawn("sc", ["query", "vgc"], { windowsHide: true });
+    let child;
+    try {
+      child = spawn("sc", ["query", "vgc"], { windowsHide: true });
+    } catch {
+      resolve(false);
+      return;
+    }
     let out = "";
     child.stdout?.on("data", (chunk) => { out += String(chunk); });
     child.on("error", () => resolve(false));
@@ -415,7 +391,13 @@ export async function runElevated(script: "install" | "uninstall"): Promise<{ ok
     return { ok: true, message: "本来就没有激活, 不需要授权" };
   }
   return new Promise((resolve) => {
-    const child = spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", `Start-Process -FilePath '${file}' -Verb RunAs -Wait`], { windowsHide: true });
+    let child;
+    try {
+      child = spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", `Start-Process -FilePath '${file}' -Verb RunAs -Wait`], { windowsHide: true });
+    } catch (error) {
+      resolve({ ok: false, message: String((error as Error).message ?? error).slice(0, 120) });
+      return;
+    }
     child.on("error", (error) => resolve({ ok: false, message: String(error.message).slice(0, 120) }));
     child.on("close", (code) => {
       if (code === 0) resolve({ ok: true, message: script === "install" ? "已激活" : "已取消激活" });
@@ -423,3 +405,9 @@ export async function runElevated(script: "install" | "uninstall"): Promise<{ ok
     });
   });
 }
+
+// 供状态展示使用: 当前加载器里的插件目录名(只有这一个)。
+export const STAGED_PLUGIN_NAME = CLIENT_PLUGIN_NAME;
+
+/** 卸载语音资源联接(供退出清理复用)。 */
+export { unmountVoiceAssets };

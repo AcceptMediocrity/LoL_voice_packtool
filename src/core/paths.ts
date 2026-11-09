@@ -113,40 +113,55 @@ export function gameBelongsToLeague(gameDir: string, leagueDir: string): boolean
 
 /* ------------------------------------------------------------------ 自动探测 */
 
-async function detectFromRegistry(): Promise<{ dir: string; detail: string } | null> {
-  const checks: Array<{ key: string; value: string; view?: "32" | "64"; label: string }> = [
-    { key: "HKCU\\Software\\Tencent\\LOL", value: "InstallPath", label: "HKCU\\Software\\Tencent\\LOL" },
-    { key: "HKLM\\SOFTWARE\\Tencent\\LOL", value: "InstallPath", view: "64", label: "HKLM\\SOFTWARE\\Tencent\\LOL" },
-    {
-      key: "HKLM\\SOFTWARE\\WOW6432Node\\Tencent\\LOL",
-      value: "InstallPath",
-      view: "32",
-      label: "HKLM\\SOFTWARE\\WOW6432Node\\Tencent\\LOL"
-    },
-    {
-      key: "HKLM\\SOFTWARE\\WOW6432Node\\Riot Games, Inc\\League of Legends",
-      value: "InstallLocation",
-      view: "32",
-      label: "HKLM\\...\\Riot Games, Inc\\League of Legends"
-    },
-    {
-      key: "HKLM\\SOFTWARE\\Riot Games, Inc\\League of Legends",
-      value: "InstallLocation",
-      view: "64",
-      label: "HKLM\\SOFTWARE\\Riot Games, Inc\\League of Legends"
-    }
-  ];
-  for (const check of checks) {
+export interface DetectedInstall {
+  dir: string;
+  detail: string;
+}
+
+/** 注册表里可能写着安装目录的位置(国服 Tencent / 国际服 Riot), 全部都要看。 */
+const REGISTRY_CHECKS: Array<{ key: string; value: string; view?: "32" | "64"; label: string }> = [
+  { key: "HKCU\\Software\\Tencent\\LOL", value: "InstallPath", label: "HKCU\\Software\\Tencent\\LOL" },
+  { key: "HKLM\\SOFTWARE\\Tencent\\LOL", value: "InstallPath", view: "64", label: "HKLM\\SOFTWARE\\Tencent\\LOL" },
+  {
+    key: "HKLM\\SOFTWARE\\WOW6432Node\\Tencent\\LOL",
+    value: "InstallPath",
+    view: "32",
+    label: "HKLM\\SOFTWARE\\WOW6432Node\\Tencent\\LOL"
+  },
+  {
+    key: "HKLM\\SOFTWARE\\WOW6432Node\\Riot Games, Inc\\League of Legends",
+    value: "InstallLocation",
+    view: "32",
+    label: "HKLM\\...\\Riot Games, Inc\\League of Legends"
+  },
+  {
+    key: "HKLM\\SOFTWARE\\Riot Games, Inc\\League of Legends",
+    value: "InstallLocation",
+    view: "64",
+    label: "HKLM\\SOFTWARE\\Riot Games, Inc\\League of Legends"
+  }
+];
+
+/**
+ * 注册表里**所有**有效的联盟安装(国服/外服可能同时装着, 不能只取第一个)。
+ */
+async function detectFromRegistryAll(): Promise<DetectedInstall[]> {
+  const found: DetectedInstall[] = [];
+  for (const check of REGISTRY_CHECKS) {
     const value = await regQueryValue(check.key, check.value, check.view);
     if (!value) continue;
     const normalized = await normalizeLeagueDir(value);
-    if (normalized) return { dir: normalized, detail: `注册表 ${check.label}` };
-    logger.debug(`注册表 ${check.label} 值无效: ${value}`);
+    if (normalized) found.push({ dir: normalized, detail: `注册表 ${check.label}` });
+    else logger.debug(`注册表 ${check.label} 值无效: ${value}`);
   }
-  return null;
+  return found;
 }
 
-async function detectFromRiotMetadata(): Promise<{ dir: string; detail: string } | null> {
+async function detectFromRegistry(): Promise<DetectedInstall | null> {
+  return (await detectFromRegistryAll())[0] ?? null;
+}
+
+async function detectFromRiotMetadata(): Promise<DetectedInstall | null> {
   const programData = process.env.ProgramData || "C:\\ProgramData";
   const metadata = path.join(
     programData,
@@ -165,37 +180,67 @@ async function detectFromRiotMetadata(): Promise<{ dir: string; detail: string }
   return null;
 }
 
-async function detectFromCommonRoots(): Promise<{ dir: string; detail: string } | null> {
-  const drives = ["C:", "D:", "E:", "F:", "G:"];
+/** 常见安装根目录: 国服走 WeGameApps, 国际服走 Riot Games(默认盘 / 各盘符)。 */
+export function commonInstallRoots(): string[] {
   const roots: string[] = [];
-  const candidates = [process.env["ProgramFiles"], process.env["ProgramFiles(x86)"], process.env["SystemDrive"]]
+  const bases = [process.env["ProgramFiles"], process.env["ProgramFiles(x86)"], process.env["SystemDrive"]]
     .filter((item): item is string => Boolean(item))
     .map((item) => (item.endsWith(":") ? `${item}\\` : item));
-  for (const base of candidates) {
+  for (const base of bases) {
     roots.push(path.join(base, "WeGameApps"));
     roots.push(path.join(base, "Riot Games"));
   }
-  for (const drive of drives) {
+  for (const drive of ["C:", "D:", "E:", "F:", "G:", "H:"]) {
     roots.push(`${drive}\\WeGameApps`);
     roots.push(`${drive}\\Riot Games`);
   }
+  // Riot 客户端也会把产品目录放在用户目录下
   roots.push(path.join(os.homedir(), "AppData", "Local", "Riot Games"));
+  return roots;
+}
 
-  const seen = new Set<string>();
+/**
+ * 在给定根目录下找**全部**联盟安装(导出便于测试)。
+ *
+ * 关键: 以前匹配到第一个就 return, 于是机器上同时装着国服与外服时永远只返回一个
+ * (通常先扫到 WeGameApps), "自动搜索"看起来就只会搜国服。
+ */
+export async function detectInInstallRoots(roots: string[]): Promise<DetectedInstall[]> {
+  const found: DetectedInstall[] = [];
+  const seenInstalls = new Set<string>();
+  const seenRoots = new Set<string>();
+  const add = async (raw: string, detail: string): Promise<void> => {
+    const normalized = await normalizeLeagueDir(raw);
+    if (!normalized) return;
+    const key = normalizeForCompare(normalized);
+    if (seenInstalls.has(key)) return;
+    seenInstalls.add(key);
+    found.push({ dir: normalized, detail });
+  };
   for (const root of roots) {
-    const key = normalizeForCompare(root);
-    if (seen.has(key)) continue;
-    seen.add(key);
+    const rootKey = normalizeForCompare(root);
+    if (seenRoots.has(rootKey)) continue;
+    seenRoots.add(rootKey);
     if (!(await isDirectory(root))) continue;
-    const children = [path.join(root, "League of Legends"), path.join(root, "英雄联盟")];
-    for (const name of await listNames(root)) children.push(path.join(root, name));
+    // 根目录**本身**就是一份安装时才直接收下。
+    // 不能在这里用 normalizeLeagueDir(root): 它只返回第一个匹配的子目录,
+    // 会把同一个根下的其它安装(比如 外服 live + PBE)吞掉。
+    if (await isValidLeagueDir(root)) await add(root, `目录扫描 ${root}`);
+    const children = new Set<string>();
+    for (const name of await listNames(root)) children.add(path.join(root, name));
+    for (const name of ["League of Legends", "League of Legends (PBE)", "英雄联盟", "英雄聯盟"]) {
+      children.add(path.join(root, name));
+    }
     for (const child of children) {
       if (!(await isDirectory(child))) continue;
-      const normalized = await normalizeLeagueDir(child);
-      if (normalized) return { dir: normalized, detail: `目录扫描 ${child}` };
+      await add(child, `目录扫描 ${child}`);
     }
   }
-  return null;
+  return found;
+}
+
+async function detectFromCommonRootsAll(): Promise<DetectedInstall[]> {
+  return detectInInstallRoots(commonInstallRoots());
 }
 
 /** 列出所有能定位到的客户端目录(诊断/前端选择用)。 */
@@ -223,12 +268,10 @@ export async function detectCandidates(): Promise<PathCandidate[]> {
   await push(process.env.LEAGUE_PATH ?? null, "env", "环境变量 LEAGUE_PATH");
   const running = await findClientExeDir();
   await push(running, "process", "运行中的 LeagueClientUx.exe");
-  const registry = await detectFromRegistry();
-  await push(registry?.dir ?? null, "registry", registry?.detail ?? "");
+  for (const item of await detectFromRegistryAll()) await push(item.dir, "registry", item.detail);
   const metadata = await detectFromRiotMetadata();
   await push(metadata?.dir ?? null, "metadata", metadata?.detail ?? "");
-  const scan = await detectFromCommonRoots();
-  await push(scan?.dir ?? null, "scan", scan?.detail ?? "");
+  for (const item of await detectFromCommonRootsAll()) await push(item.dir, "scan", item.detail);
   return found;
 }
 
@@ -293,7 +336,7 @@ export async function resolveGamePaths(options: ResolveOptions = {}): Promise<Ga
         source = "metadata";
         sourceDetail = metadata.detail;
       } else {
-        const scan = await detectFromCommonRoots();
+        const scan = (await detectFromCommonRootsAll())[0];
         if (scan) {
           leagueDir = scan.dir;
           source = "scan";

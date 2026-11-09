@@ -6,18 +6,43 @@ import type { ModuleContext } from "../core/types.ts";
 import { isGameRunning } from "../core/win/processes.ts";
 import { wadSuffix } from "../packs/baselocale.ts";
 import { localeDisplayName } from "../packs/locales.ts";
-import { langSources } from "../packs/wad.ts";
+import { availableSuffixes, buildSlotIndex, langSources, pickTargetSuffix, slotFileName } from "../packs/wad.ts";
 import { applyIngameFont, restoreIngameFont } from "./ingameFont.ts";
 
 const MODULE = "ingame_lang" as const;
 
-/** 目标文件: Localized/Global.<基准语种>.wad.client(国服 zh_CN, 国际服按实际语种)。 */
-function targetName(context: ModuleContext): string {
+/** 首选目标: Localized/Global.<基准语种>.wad.client(国服 zh_CN, 国际服按实际语种)。 */
+function preferredName(context: ModuleContext): string {
   return `Global${wadSuffix(context.baseLocale)}`;
 }
 
-function targetPath(finalDir: string, context: ModuleContext): string {
-  return path.join(finalDir, "Localized", targetName(context));
+interface LangTarget {
+  name: string;
+  dst: string;
+  /** 首选槽位对不上、且游戏里有多个语种槽位时的候选列表(空 = 不歧义)。 */
+  ambiguous: string[];
+}
+
+/**
+ * 解析要替换的文本槽位。
+ *
+ * 为什么不能只拼 `Global.<基准语种>`: 国际服常见"默认语种用无后缀文件"
+ * (Global.wad.client), 或者客户端语言与文件槽位不一致。这里和语音一样先看游戏里
+ * 实际存在哪些槽位: 首选在就用首选; 只有唯一槽位就用它; 多个且对不上才报歧义。
+ */
+async function resolveTarget(destDir: string, context: ModuleContext): Promise<LangTarget> {
+  const preferred = preferredName(context);
+  const index = await buildSlotIndex(destDir);
+  const suffix = pickTargetSuffix(index, "Global", wadSuffix(context.baseLocale));
+  if (suffix !== null) {
+    const name = slotFileName("Global", suffix);
+    return { name, dst: path.join(destDir, name), ambiguous: [] };
+  }
+  // 首选文件没了但备份还在: 说明槽位本来就是首选那个, 让 replaceFile 用备份兜底
+  if (await pathExists(backupPath(path.join(destDir, preferred)))) {
+    return { name: preferred, dst: path.join(destDir, preferred), ambiguous: [] };
+  }
+  return { name: preferred, dst: path.join(destDir, preferred), ambiguous: availableSuffixes(index, "Global") };
 }
 
 /** 切换游戏内文本语言包。 */
@@ -46,8 +71,6 @@ export async function applyIngameLang(locale: string, context: ModuleContext): P
   }
 
   const destDir = path.join(context.finalDir, "Localized");
-  const dst = targetPath(context.finalDir, context);
-  const name = targetName(context);
   context.progress?.(0, 1);
 
   const [usable, why] = await targetDirState(destDir);
@@ -58,7 +81,23 @@ export async function applyIngameLang(locale: string, context: ModuleContext): P
       failed: 1,
       reason: `替换失败 1 个：${why}`,
       message: `替换失败 1 个：${why}`,
-      errors: [`${name}: ${why}`]
+      errors: [`${preferredName(context)}: ${why}`]
+    });
+  }
+
+  const target = await resolveTarget(destDir, context);
+  const { name, dst } = target;
+  if (target.ambiguous.length > 1) {
+    const slots = target.ambiguous.map((item) => item.replace(".wad.client", "")).join(" / ");
+    return makeResult(MODULE, false, {
+      planned: 1,
+      success: 0,
+      failed: 1,
+      reason: `替换失败 1 个：${SLOT_MISSING_REASON}`,
+      message:
+        `游戏内 Global 文本有多个语种槽位（${slots}），无法确定当前客户端用哪一个。\n` +
+        `请把客户端切成对应语种，或在工具配置里指定 baseLocale（当前基准语种 ${context.baseLocale}）。`,
+      errors: [`${name}: 多个语种槽位 ${slots}`]
     });
   }
 
@@ -84,7 +123,7 @@ export async function applyIngameLang(locale: string, context: ModuleContext): P
       success: 1,
       failed: 0,
       message: `游戏内语言 1/1 已切换为 ${localeDisplayName(locale)}${fontNote}`,
-      detail: { target: dst, base_locale: context.baseLocale, font_changed: font.changed }
+      detail: { target: dst, slot: name, base_locale: context.baseLocale, font_changed: font.changed }
     });
   }
   return makeResult(MODULE, false, {

@@ -179,31 +179,36 @@ test("空模块列表 = 一个都不切(不能被当成『全都要』)", async 
   assert.equal(state.json.state.ingame.active_locale ?? "", before2.active_locale ?? "", "什么都没勾时, 生效语种不该变");
 });
 
-test("客户端未启动: 只有勾选选人语音才拦截(对局语音/语言不受影响)", async () => {
+test("客户端未启动: 开启与一键开启都不再拦截(预部署, 下次启动生效)", async () => {
   setClientRunningOverride(async () => false);
   try {
-    // 含选人语音 -> 明确拒绝
-    const blocked = await post("/api/apply", { locale: "ja_JP", modules: ["lobby_voice"] });
-    assert.equal(blocked.json.ok, false);
-    assert.equal(blocked.json.blocked, true);
-    assert.match(blocked.json.message, /英雄联盟未启动/);
+    // 只勾选人语音: 以前会 blocked, 现在应该照常部署
+    const lobby = await post("/api/apply", { locale: "ja_JP", restartClient: false, modules: ["lobby_voice"] });
+    assert.equal(lobby.json.ok, true, JSON.stringify(lobby.json));
+    assert.equal(lobby.json.blocked, undefined, "客户端没开也不该拒绝");
+    const lobbyDone = await waitTask(lobby.json.task.id);
+    assert.equal(lobbyDone.task.status, "succeeded", JSON.stringify(lobbyDone.result));
+    assert.equal(lobbyDone.result.results[0].detail.client_running, false);
+    assert.match(String(lobbyDone.result.results[0].message), /下次启动客户端/, "要说明什么时候生效");
 
-    // 一键开启默认包含选人语音 -> 同样拒绝
-    const oneClick = await post("/api/oneclick/apply", { locale: "ja_JP" });
-    assert.equal(oneClick.json.blocked, true);
+    // 一键开启默认包含选人语音: 同样不再拦截
+    const oneClick = await post("/api/oneclick/apply", { locale: "ja_JP", restartClient: false });
+    assert.equal(oneClick.json.blocked, undefined);
+    assert.equal(oneClick.json.ok, true);
+    const oneDone = await waitTask(oneClick.json.task.id);
+    assert.equal(oneDone.task.status, "succeeded", JSON.stringify(oneDone.result));
 
-    // 只勾对局语音 -> 允许(只改游戏文件, 不需要客户端在运行)
+    // 只勾对局语音 -> 照常
     const allowed = await post("/api/apply", { locale: "ja_JP", restartClient: false, modules: ["ingame_voice"] });
     assert.equal(allowed.json.blocked, undefined, "纯对局模块不该被拦截");
     assert.equal(allowed.json.ok, true);
     if (allowed.json.task?.id) await waitTask(allowed.json.task.id);
 
-    // 选人语音 + 对局语音 -> 不再整体拦截, 而是跳过选人语音继续做 (用户实测:
-    // 勾着默认就有的选人语音时, 没开客户端连对局语音都开不了, 而且页面只剩一句 TypeError)
+    // 混合勾选: 不再跳过选人语音, 也不该出现"已跳过"warning
     const mixed = await post("/api/apply", { locale: "ja_JP", restartClient: false, modules: ["lobby_voice", "ingame_voice"] });
     assert.equal(mixed.json.blocked, undefined, "混合勾选不该整体拦截");
     assert.equal(mixed.json.ok, true);
-    assert.match(String(mixed.json.warning ?? ""), /选人语音/, "必须告诉用户选人语音被跳过了");
+    assert.equal(mixed.json.warning, undefined, "不再有『跳过选人语音』这回事");
     assert.ok(mixed.json.task?.id, "必须照常返回任务");
     const mixedDone = await waitTask(mixed.json.task.id);
     assert.equal(mixedDone.task.status, "succeeded", JSON.stringify(mixedDone.result));
@@ -250,23 +255,25 @@ test("大厅选人语音: 部署插件 + 目录联接, 不改客户端文件, �
   assert.equal(json.ok, true);
   const finished = await waitTask(json.task.id);
   assert.equal(finished.result.ok, true, JSON.stringify(finished.result.summary));
-  assert.equal(finished.result.results[0].detail.mechanism, "pengu-audio");
+  assert.equal(finished.result.results[0].detail.mechanism, "client-plugin");
   assert.equal(finished.result.results[0].detail.locale, "ja_JP");
   assert.equal(finished.result.results[0].detail.available, 2, "夹具里有两个选人台词");
 
   // 插件和联接都落在加载器目录里, 不碰客户端目录
-  const pluginDir = path.join(process.env.LOCALAPPDATA!, "LoL_Voice", "loader", "plugins", "voice-sync");
+  const pluginDir = path.join(process.env.LOCALAPPDATA!, "LoL_Voice", "loader", "plugins", "chosen-voice");
   assert.equal(await exists(path.join(pluginDir, "index.js")), true, "插件本体应已就位");
+  assert.equal(await exists(path.join(pluginDir, "text.js")), true, "文字内核应一并就位(同一个插件)");
   assert.equal(await exists(path.join(pluginDir, "voice_assets", "champion-choose-vo", "100.ogg")), true, "捷接应能读到语音包");
   const config = JSON.parse(await readFile(path.join(pluginDir, "config.json")));
-  assert.deepEqual(config, { enabled: true, locale: "ja_JP", cdn_locale: "ja_jp" });
-  const script = await readFile(path.join(pluginDir, "index.js"));
-  assert.match(script, /var enabled = true;/, "代码里的开关也要同步打开");
+  assert.equal(config.voice.enabled, true, "文本开关也要同步打开");
+  assert.equal(config.voice.locale, "ja_JP");
+  assert.equal(config.voice.cdn_locale, "ja_jp");
+  assert.equal(config.text.enabled, false, "只开选人语音时不能顺手打开界面文字");
 
   // 状态与插件一致
   const state = await get("/api/state");
   assert.equal(state.json.state.lobby.enabled, true);
-  assert.equal(state.json.state.lobby.mechanism, "pengu-audio");
+  assert.equal(state.json.state.lobby.mechanism, "client-plugin");
   assert.equal(state.json.state.lobby.locale, "ja_JP");
   assert.equal(state.json.state.lobby.available, 2);
 
@@ -274,15 +281,16 @@ test("大厅选人语音: 部署插件 + 目录联接, 不改客户端文件, �
   assert.equal(await readFile(path.join(fixture!.leagueDir, "d3d9.dll")), d3d9Before);
   assert.equal(await exists(path.join(fixture!.leagueDir, "Plugins")), pluginDirExists);
 
-  // 关闭: 开关关掉、联接拆掉
+  // 关闭: 开关关掉、联接拆掉, 但插件文件保留(下次开启不用重装)
   const closed = await post("/api/restore", { modules: ["lobby_voice"], restartClient: false });
   const closedTask = await waitTask(closed.json.task.id);
   assert.equal(closedTask.result.ok, true);
   const after = await get("/api/state");
   assert.equal(after.json.state.lobby.enabled, false);
   const off = JSON.parse(await readFile(path.join(pluginDir, "config.json")));
-  assert.equal(off.enabled, false);
+  assert.equal(off.voice.enabled, false);
   assert.equal(await exists(path.join(pluginDir, "voice_assets")), false, "联接应已拆除");
+  assert.equal(await exists(path.join(pluginDir, "index.js")), true, "插件文件要留着");
 });
 
 test("大厅选人语音: 语音包里没有该语种时明确失败", async () => {
@@ -545,6 +553,36 @@ test("提示设置: POST /api/ui/hide-enable-tip 写进配置, /api/state 里读
 
   const after = await get("/api/state");
   assert.equal((after.json.state as any).hide_enable_tip, true, "设置之后应为 true");
+});
+
+test("客户端界面文字: 只开文字时两个开关互相独立, 也不碰局内文件", async () => {
+  const pluginDir = path.join(process.env.LOCALAPPDATA!, "LoL_Voice", "loader", "plugins", "chosen-voice");
+  const ingameFile = path.join(fixture!.finalDir, "Champions", "Ahri.zh_CN.wad.client");
+  const ingameBefore = await readFile(ingameFile);
+
+  const applied = await post("/api/apply", { locale: "ja_JP", modules: [], restartClient: false, clientText: true, clientTextLocale: "ja_jp" });
+  assert.equal(applied.json.ok, true, JSON.stringify(applied.json));
+  const done = await waitTask(applied.json.task.id);
+  assert.equal(done.result.ok, true, JSON.stringify(done.result.summary));
+
+  const config = JSON.parse(await readFile(path.join(pluginDir, "config.json")));
+  assert.equal(config.text.enabled, true);
+  assert.equal(config.text.locale, "ja_jp");
+  assert.equal(config.voice.enabled, false, "开文字不能顺手打开选人语音");
+  assert.equal(await exists(path.join(pluginDir, "lang", "ja_jp.js")), true, "字典要按需写进同一个插件");
+
+  // 局内文件一个字节都不动
+  assert.equal(await readFile(ingameFile), ingameBefore);
+
+  const state = await get("/api/textpack");
+  assert.equal(state.json.state.active, true);
+  assert.equal(state.json.state.staged, "ja_jp");
+
+  // 关掉文字: 只改开关, 插件文件保留
+  await post("/api/apply", { locale: "ja_JP", modules: [], restartClient: false, clientText: false }).then((r) => waitTask(r.json.task.id));
+  const off = JSON.parse(await readFile(path.join(pluginDir, "config.json")));
+  assert.equal(off.text.enabled, false);
+  assert.equal(await exists(path.join(pluginDir, "index.js")), true);
 });
 
 });

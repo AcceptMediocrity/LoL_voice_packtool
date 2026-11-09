@@ -3,14 +3,9 @@
  *
  * 机制: **加载器插件在运行时替换客户端要播的那两句台词** —— 客户端资源包一个字节都不改。
  *
- * 为什么不是直接改资源包: 客户端对 Plugins/rcp-be-lol-game-data/<语种>-assets.wad 有严格的
- * 内容校验(日志: WadFile chunk verification failed), 校验值私有, 40 种常见算法全部不匹配;
- * 连"数据一字不改、只把数据挪到文件尾部"都会让客户端黑屏。
- *
- * 为什么不是以前的"LCU 监听 + 工具窗口播报": 那条路要求工具窗口一直开着、有轮询延迟、
- * 还得靠抑制客户端原声来避免双响。插件路线由客户端自己播, 音画天然同步。
- *
- * 关键: 只部署文件 + 建目录联接, **不需要客户端正在运行**, 也不需要进游戏。
+ * 插件是 `chosen-voice`(和"客户端界面文字"共用同一个插件, 各自一个开关):
+ *   本次只负责写 voice.enabled / voice.locale, 并把语音包的 assets 目录挂给插件。
+ * 客户端没开也能部署; 客户端开着的话重启一次才生效。
  */
 import path from "node:path";
 import { isClientRunning } from "../core/win/processes.ts";
@@ -24,15 +19,16 @@ import { lobbyPatchState, restoreLobbyVoiceWad } from "../packs/lobbyWad.ts";
 import {
   cdnLocaleOf,
   countVoiceLines,
-  isVoicePluginStaged,
-  readVoiceTrace,
+  isClientPluginStaged,
   mountVoiceAssets,
-  readVoiceConfig,
-  stageVoicePlugin,
+  readClientConfig,
+  readClientTrace,
+  stageClientPlugin,
   unmountVoiceAssets,
-  writeVoiceConfig
-} from "../packs/voicePlugin.ts";
+  writeClientConfig
+} from "../packs/clientPlugin.ts";
 import { readRegistry, runElevated, stageLoader } from "../textpack/deploy.ts";
+import { assertNoForeignLoader } from "../packs/loaderConflict.ts";
 import type { SwitchEnv } from "./context.ts";
 
 const logger = createLogger("lobby_voice");
@@ -66,7 +62,7 @@ async function cleanupLegacyPatch(env: SwitchEnv): Promise<string | null> {
 }
 
 /**
- * 开启: 部署插件 + 把语音包的音频联接给插件 + 打开开关。
+ * 开启: 部署加载器 + 单一客户端插件 + 把语音包音频联接给插件 + 打开 voice 开关。
  * 全程不要求客户端运行; 客户端开着的话, 重启一次才生效。
  */
 export async function applyLobbyVoice(
@@ -100,7 +96,7 @@ export async function applyLobbyVoice(
     return makeResult(MODULE, false, { planned: 1, success: 0, failed: 1, reason: "部署失败", message: loader.message });
   }
   if (loader.locked.length) notes.push(loader.locked.join("、"));
-  const staged = await stageVoicePlugin();
+  const staged = await stageClientPlugin();
   if (!staged.ok) {
     return makeResult(MODULE, false, { planned: 1, success: 0, failed: 1, reason: "部署失败", message: staged.message });
   }
@@ -112,16 +108,29 @@ export async function applyLobbyVoice(
   }
 
   progress?.(3, 4, "写入开关");
-  const written = await writeVoiceConfig({ enabled: true, locale, cdn_locale: cdnLocaleOf(locale) });
+  const written = await writeClientConfig({ voice: { enabled: true, locale, cdn_locale: cdnLocaleOf(locale) } });
   if (!written.ok) {
     return makeResult(MODULE, false, { planned: 1, success: 0, failed: 1, reason: "写入失败", message: written.message });
   }
 
   // 加载器没激活 => core.dll 不会注入 => 插件根本跑不起来(只能听到原声)。
-  // 这一步必须当场做掉: 文字翻译和选人语音共用同一个注册表项, 用户只开语音时没人替他激活。
+  // 这一步必须当场做掉: 文字和选人语音共用同一个注册表项, 用户只开语音时没人替他激活。
   let registry = await readRegistry();
   const clientRunning = await isClientRunning();
   if (registry !== "set") {
+    // 已有别的加载器在注入客户端时, 再写 IFEO 会变成"两个 core.dll 抢着 hook",
+    // 实测会让 LeagueClientUx 崩在 core.dll 的特征扫描里, 直接进不去客户端。
+    const guard = await assertNoForeignLoader(env.leagueDir);
+    if (!guard.ok) {
+      return makeResult(MODULE, false, {
+        planned: 1,
+        success: 0,
+        failed: 1,
+        reason: "激活被阻止",
+        message: guard.message,
+        detail: { mechanism: "client-plugin", locale, available, notes }
+      });
+    }
     progress?.(3, 5, "等待管理员授权");
     const elevated = await runElevated("install");
     if (!elevated.ok) {
@@ -131,7 +140,7 @@ export async function applyLobbyVoice(
         failed: 1,
         reason: "激活失败",
         message: "已复制文件，但加载器没有激活（需要管理员授权一次）：" + elevated.message,
-        detail: { mechanism: "pengu-audio", locale, available, notes }
+        detail: { mechanism: "client-plugin", locale, available, notes }
       });
     }
     registry = await readRegistry();
@@ -150,7 +159,8 @@ export async function applyLobbyVoice(
     failed: 0,
     message,
     detail: {
-      mechanism: "pengu-audio",
+      mechanism: "client-plugin",
+      plugin: "chosen-voice",
       locale,
       available,
       assets_root: assetsRoot,
@@ -162,15 +172,15 @@ export async function applyLobbyVoice(
   });
 }
 
-/** 关闭: 关掉开关并拆掉联接(插件文件留着, 下次开启不用重新复制)。 */
+/** 关闭: 只关 voice 开关 + 拆掉联接(插件文件留着, 下次开启不用重新复制)。 */
 export async function restoreLobbyVoice(env: SwitchEnv, options: LobbyVoiceOptions = {}): Promise<ModuleResult> {
   const progress = options.progress;
   progress?.(0, 3, "关闭开关");
 
-  const before = await readVoiceConfig();
-  const wasEnabled = before?.enabled === true && Boolean(before?.locale) && before?.locale !== "zh_CN";
+  const before = await readClientConfig();
+  const wasEnabled = before.voice.enabled && before.voice.locale !== "zh_CN";
 
-  const written = await writeVoiceConfig({ enabled: false, locale: "zh_CN", cdn_locale: "zh_cn" });
+  const written = await writeClientConfig({ voice: { enabled: false, locale: "zh_CN", cdn_locale: "zh_cn" } });
   progress?.(1, 3, "拆除联接");
   await unmountVoiceAssets();
 
@@ -189,7 +199,7 @@ export async function restoreLobbyVoice(env: SwitchEnv, options: LobbyVoiceOptio
     success: 1,
     failed: 0,
     message: wasEnabled ? "已关闭选人语音" : "选人语音本来就未开启",
-    detail: { mechanism: "pengu-audio", stopped: wasEnabled, notes }
+    detail: { mechanism: "client-plugin", stopped: wasEnabled, notes }
   });
 }
 
@@ -200,7 +210,7 @@ export interface LobbyStatus {
   enabled: boolean;
   locale: string;
   /** 实现机制: 加载器插件在运行时替换音频, 不改客户端资源包。 */
-  mechanism: "pengu-audio";
+  mechanism: "client-plugin";
   /** 语音包里该语种的选人/禁用台词条数。 */
   available: number;
   /** 兼容旧字段: 插件模式不轮询, 恒为 false。 */
@@ -216,45 +226,46 @@ export interface LobbyStatus {
   message: string;
 }
 
-/** 选人语音当前是否开着(插件就位 + 开关打开 + 不是中文原样)。 */
+/** 选人语音当前是否开着(插件就位 + voice 开关打开 + 不是中文原样)。 */
 export async function lobbyVoiceEnabled(): Promise<boolean> {
-  const config = await readVoiceConfig();
-  if (!config || config.enabled !== true || config.locale === "zh_CN") return false;
-  return isVoicePluginStaged();
+  const config = await readClientConfig();
+  if (!config.voice.enabled || config.voice.locale === "zh_CN") return false;
+  return isClientPluginStaged();
 }
 
 /** 大厅端状态(界面"对局前选人语音"卡片用)。 */
 export async function getLobbyStatus(env: SwitchEnv): Promise<LobbyStatus> {
-  const config = await readVoiceConfig();
-  const staged = await isVoicePluginStaged();
-  const enabled = staged && config?.enabled === true && config.locale !== "zh_CN";
-  const locale = enabled ? config!.locale : env.config.defaultLocale;
+  const config = await readClientConfig();
+  const staged = await isClientPluginStaged();
+  const enabled = staged && config.voice.enabled && config.voice.locale !== "zh_CN";
+  const locale = enabled ? config.voice.locale : env.config.defaultLocale;
   const available = await countVoiceLines(lobbyAssetsRoot(env, locale));
   const [clientRunning, located] = await Promise.all([
     isClientRunning(),
     locateClientAssetWad(env.leagueDir, env.baseLocale)
   ]);
   const legacy = located.path ? (await lobbyPatchState(located.path)).patched : false;
-  const trace = await readVoiceTrace();
+  const trace = await readClientTrace();
+  const hits = trace?.voiceHits ?? 0;
 
   const parts: string[] = [];
   if (enabled) {
-    parts.push("已开启（" + localeDisplayName(config!.locale) + "）");
+    parts.push("已开启（" + localeDisplayName(config.voice.locale) + "）");
     parts.push("共 " + available + " 条台词");
   } else {
     parts.push("未开启");
   }
-  if (enabled && trace && trace.hits > 0) parts.push("已拦截 " + trace.hits + " 次");
+  if (enabled && hits > 0) parts.push("已拦截 " + hits + " 次");
   else if (enabled && !trace) parts.push("等待客户端注入");
   if (legacy) parts.push("检测到旧资源包补丁, 还原即可回滚");
 
   return {
     ok: true,
-    voice: enabled ? "已开启（" + localeDisplayName(config!.locale) + "）" : "未开启",
+    voice: enabled ? "已开启（" + localeDisplayName(config.voice.locale) + "）" : "未开启",
     lang: "未知",
     enabled,
     locale,
-    mechanism: "pengu-audio",
+    mechanism: "client-plugin",
     available,
     listening: false,
     presence: clientRunning ? "out" : "offline",
@@ -262,7 +273,7 @@ export async function getLobbyStatus(env: SwitchEnv): Promise<LobbyStatus> {
     client_running: clientRunning,
     legacy_wad_patch: legacy,
     wad_file: located.path,
-    trace: trace ? { hits: trace.hits, at: trace.at } : null,
+    trace: trace ? { hits, at: trace.at } : null,
     message: parts.join(" · ")
   };
 }

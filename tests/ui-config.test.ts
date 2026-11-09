@@ -233,3 +233,22 @@ test("外服未替换时状态显示原版，不显示国服", async () => {
   assert.equal(page.el("statusIngameVoice").textContent, "原版");
   assert.equal(page.el("statusIngameLang").textContent, "原版");
 });
+
+test("配置里的路径失效时显示真正解析到的目录, 也不会误判成外服", async () => {
+  // 用户换了安装位置后, config 里还留着旧的 Riot 路径, 后端实际用的是注册表里那台 WeGame。
+  const config = {
+    leaguePath: "E:\\Riot Games\\League of Legends",
+    defaultLocale: "ja_JP",
+    ui: { selectedLocale: "ja_JP", modules: [], region: "auto" }
+  };
+  const page = await openWindow(config, {}, false, {
+    paths: {
+      leagueDir: "E:\\WeGameApps\\英雄联盟\\LeagueClient",
+      source: "registry",
+      sourceDetail: "注册表 HKCU\\Software\\Tencent\\LOL"
+    }
+  });
+  await page.settle();
+  assert.equal(page.el("leaguePathInput").value, "E:\\WeGameApps\\英雄联盟\\LeagueClient", "要显示真正在用的目录");
+  assert.notEqual(page.el("regionText").textContent, "外服", "拿失效的旧路径判断渠道会误报外服");
+});

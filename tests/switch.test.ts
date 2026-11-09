@@ -6,7 +6,7 @@ import { applyIngameLang, restoreIngameLang } from "../src/modules/ingameLang.ts
 import { applyIngameVoice, restoreIngameVoice } from "../src/modules/ingameVoice.ts";
 import { backupPath } from "../src/core/fsx.ts";
 import { getIngameStatus } from "../src/packs/inventory.ts";
-import { cleanupSuite, useSuite, exists, makeFinalDir, makePack, makeTempDir, readFile } from "./helpers.ts";
+import { cleanupSuite, useSuite, exists, makeFinalDir, makePack, makeTempDir, readFile, writeFile } from "./helpers.ts";
 
 useSuite("switch");
 
@@ -102,6 +102,45 @@ test("对局语言: 只替换 Global 槽位, 还原到国服简中", async () =>
   const restored = await restoreIngameLang({ voiceRoot, finalDir, leagueDir: null, baseLocale: "zh_CN" });
   assert.equal(restored.ok, true, restored.message);
   assert.equal(await readFile(path.join(finalDir, "Localized", "Global.zh_CN.wad.client")), "CN-LANG");
+});
+
+test("对局语言: 国际服默认语种用无后缀槽位时也能替换", async () => {
+  const root = await makeTempDir("switch-lang-default");
+  const voiceRoot = path.join(root, "voice");
+  const finalDir = path.join(root, "game", "DATA", "FINAL");
+  await makePack(voiceRoot, "ja_JP", { champions: [], maps: [] });
+  // 国际服常见: 默认语种就是 Global.wad.client(没有 .en_US 后缀)
+  await writeFile(path.join(finalDir, "Localized", "Global.wad.client"), "DEFAULT-LANG");
+
+  const context = { voiceRoot, finalDir, leagueDir: null, baseLocale: "en_US" };
+  const applied = await applyIngameLang("ja_JP", context);
+  assert.equal(applied.ok, true, applied.message);
+  assert.equal(await readFile(path.join(finalDir, "Localized", "Global.wad.client")), "ja_JP-LANG");
+  assert.equal((applied.detail as { slot?: string }).slot, "Global.wad.client");
+  assert.equal(await exists(path.join(finalDir, "Localized", "Global.en_US.wad.client")), false, "不能凭空建槽位");
+
+  const restored = await restoreIngameLang(context);
+  assert.equal(restored.ok, true, restored.message);
+  assert.equal(await readFile(path.join(finalDir, "Localized", "Global.wad.client")), "DEFAULT-LANG");
+});
+
+test("对局语言: 多个语种槽位且首选对不上时报歧义, 绝不乱写", async () => {
+  const root = await makeTempDir("switch-lang-ambiguous");
+  const voiceRoot = path.join(root, "voice");
+  const finalDir = path.join(root, "game", "DATA", "FINAL");
+  await makePack(voiceRoot, "ja_JP", { champions: [], maps: [] });
+  await writeFile(path.join(finalDir, "Localized", "Global.wad.client"), "DEFAULT-LANG");
+  await writeFile(path.join(finalDir, "Localized", "Global.ko_KR.wad.client"), "KO-LANG");
+  await writeFile(path.join(finalDir, "Localized", "Global.zh_TW.wad.client"), "TW-LANG");
+
+  const applied = await applyIngameLang("ja_JP", { voiceRoot, finalDir, leagueDir: null, baseLocale: "en_US" });
+  assert.equal(applied.ok, false);
+  assert.match(applied.message, /多个语种槽位/);
+  assert.match(applied.message, /ko_KR/);
+  // 一个文件都不能动
+  assert.equal(await readFile(path.join(finalDir, "Localized", "Global.wad.client")), "DEFAULT-LANG");
+  assert.equal(await exists(path.join(finalDir, "Localized", "Global.en_US.wad.client")), false);
+  assert.equal(await exists(backupPath(path.join(finalDir, "Localized", "Global.wad.client"))), false);
 });
 
 test("跨语种隔离: 包里混入 ko_KR 文件时, 切成 ja_JP 不会用错语种", async () => {

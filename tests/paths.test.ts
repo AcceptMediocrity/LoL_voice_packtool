@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { findGameDir, gameBelongsToLeague, normalizeLeagueDir, pathsEquivalent, resolveGamePaths } from "../src/core/paths.ts";
+import { detectInInstallRoots, findGameDir, gameBelongsToLeague, normalizeLeagueDir, pathsEquivalent, resolveGamePaths } from "../src/core/paths.ts";
 import { cleanupSuite, useSuite, exists, makeLeagueInstall, makeTempDir, writeFile } from "./helpers.ts";
 
 useSuite("paths");
@@ -44,6 +44,31 @@ test("findGameDir / gameBelongsToLeague: WeGame 与 Riot 两种布局", async ()
   await writeFile(path.join(riot, "Game", "League of Legends.exe"), "x");
   assert.equal(await findGameDir(riot), path.join(riot, "Game"));
   assert.equal(gameBelongsToLeague(path.join(riot, "Game"), riot), true);
+});
+
+test("自动搜索: 国服与外服(含 PBE)同时存在时都要找出来, 不能只返回第一个", async () => {
+  const root = await makeTempDir("paths-roots");
+  const wegameRoot = path.join(root, "WeGameApps");
+  const riotRoot = path.join(root, "Riot Games");
+
+  // 国服/WeGame 布局: <root>\WeGameApps\英雄联盟\LeagueClient\LeagueClient.exe
+  await writeFile(path.join(wegameRoot, "英雄联盟", "LeagueClient", "LeagueClient.exe"), "x");
+  await writeFile(path.join(wegameRoot, "英雄联盟", "Game", "League of Legends.exe"), "x");
+  // 国际服/Riot 布局: <root>\Riot Games\League of Legends\LeagueClient.exe
+  await writeFile(path.join(riotRoot, "League of Legends", "LeagueClient.exe"), "x");
+  await writeFile(path.join(riotRoot, "League of Legends", "Game", "League of Legends.exe"), "x");
+  // 测试服通常叫 League of Legends (PBE)
+  await writeFile(path.join(riotRoot, "League of Legends (PBE)", "LeagueClient.exe"), "x");
+
+  // 同一个根传两次也不能出现重复项
+  const found = await detectInInstallRoots([wegameRoot, riotRoot, wegameRoot]);
+  const dirs = found.map((item) => item.dir);
+  assert.equal(dirs.length, 3, "国服 + 外服 + PBE 都要列出来: " + dirs.join(" | "));
+  assert.ok(dirs.some((dir) => dir.endsWith(`英雄联盟${path.sep}LeagueClient`)), dirs.join(" | "));
+  assert.ok(dirs.includes(path.join(riotRoot, "League of Legends")), dirs.join(" | "));
+  assert.ok(dirs.includes(path.join(riotRoot, "League of Legends (PBE)")), dirs.join(" | "));
+  // 不存在的根目录直接跳过, 不报错
+  assert.deepEqual(await detectInInstallRoots([path.join(root, "nope")]), []);
 });
 
 test("resolveGamePaths: 显式路径 -> 直接解析出 FINAL 目录", async () => {

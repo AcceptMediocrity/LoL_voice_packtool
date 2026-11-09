@@ -105,7 +105,7 @@ export async function checkModuleResources(
       planned: 1,
       missing: false,
       reason: "",
-      message: `选人语音 ${oggs.length} 个（LCU 监听 + 本地播报，不改客户端文件）`
+      message: `选人语音 ${oggs.length} 个（客户端插件在运行时替换，不改客户端文件）`
     };
   }
 

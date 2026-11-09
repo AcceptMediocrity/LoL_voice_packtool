@@ -59,18 +59,11 @@
     }
   }
 
-  // 客户端是否在运行(null = 还不知道)。"开启语音包"要求客户端在跑, 因为选人语音必须连 LCU
-  let clientRunning = null;
-
-  // 只有勾选了"选人语音"(lobby_voice)才需要客户端在运行 —— 它必须连 LCU
-  function lobbyVoiceNeedsClient() {
-    const box = $("modLobbyVoice");
-    return Boolean(box && box.checked) && clientRunning === false;
-  }
+  // "开启语音包"不再因为"没检测到客户端"而禁用: 后端会跳过需要客户端的项(选人语音),
+  // 其余(对局语音/对局文字)照常执行, 并在状态栏给出提示。
 
   function applyDisabledStates() {
     const busy = Boolean(store.busy);
-    const clientDown = lobbyVoiceNeedsClient();
     for (const id of [
       "btnAutoSearchPath",
       "btnConfirmPath",
@@ -83,13 +76,7 @@
       const el = $(id);
       if (!el) continue;
       // 恢复原版永远可用(出问题时要能还原)
-      const blockedByClient = id === "btnApply" && clientDown;
-      el.disabled = busy || blockedByClient;
-      if (id === "btnApply") {
-        el.title = clientDown
-          ? "勾选了选人语音，但英雄联盟没在运行：先启动客户端并登录到大厅（只勾对局语音/语言不需要）"
-          : "";
-      }
+      el.disabled = busy;
     }
   }
 
@@ -304,7 +291,6 @@
       }
     }
     renderLocaleRow();
-    void syncTextPackLocale();
   }
 
   function renderLocaleRow() {
@@ -361,14 +347,17 @@
 
   function renderPathRow() {
     const input = $("leaguePathInput");
-    const configured = store.config && store.config.leaguePath;
-    const detected = store.state && store.state.paths && store.state.paths.leagueDir;
-    const sourceDetail = store.state && store.state.paths && store.state.paths.sourceDetail;
-    const currentPath = configured || detected || "";
+    const configured = (store.config && store.config.leaguePath) || "";
+    const paths = (store.state && store.state.paths) || {};
+    const detected = paths.leagueDir || "";
+    // 配置里的路径没被采用(比如用户换了安装位置)时, 显示**真正解析到**的目录。
+    // 否则界面会拿一个失效路径去判断国服/外服, 出现"外服 · 自带英文(基准语种 zh_CN)"这种自相矛盾。
+    const fromConfig = paths.source === "config" || paths.source === "env";
+    const currentPath = fromConfig ? configured : detected || configured;
     if (document.activeElement !== input) {
       input.value = currentPath;
     }
-    const detectedRegion = detectRegionFromPath(input.value || currentPath, sourceDetail);
+    const detectedRegion = detectRegionFromPath(input.value || currentPath, paths.sourceDetail);
     if (detectedRegion && preferenceRegion === "auto") {
       setServerRegion(detectedRegion, false);
     }
@@ -521,51 +510,52 @@
   /** 只在第一次读到状态时, 用真实状态初始化第四项的勾选; 之后不再覆盖用户的选择。 */
   let textPackInitialized = false;
 
-  /** 状态画在勾选项上: 已开启就勾上; 语音包语言没有对应文字包时禁用并说明原因。 */
+  const TEXTPACK_NAMES = { en_us: "英文", ja_jp: "日文", ko_kr: "韩文", ru_ru: "俄文" };
+
+  /**
+   * 状态画在勾选项上: 已开启就勾上; 语音包语言没有对应文字包时禁用并说明原因。
+   *
+   * 注意状态卡只认 textPackState(实际注入的语言), 与下拉栏当前选中的语音包无关 ——
+   * 在下拉栏里浏览别的语音包不应该让卡片变成"原版"。
+   */
   function renderTextPack(state) {
     if (state) textPackState = state;
     const box = $("modClientText");
     if (!box || !textPackState) return;
-    const locale = textPackLocale();
+    const target = textPackLocale();
     const supported = (textPackState && textPackState.supported) || [];
-    if (supported.length && supported.indexOf(locale) < 0) {
+    const active = Boolean(textPackState.active);
+    const staged = String(textPackState.staged || "");
+
+    if (supported.length && supported.indexOf(target) < 0) {
       box.checked = false;
       box.disabled = true;
       box.title = "没有这个语言的文字包";
-      return;
+    } else {
+      box.disabled = false;
+      // 勾选是"这次要不要一起开"的选项, 由用户掌握; 真实状态看下面那张状态卡。
+      // 但软件刚启动时要跟真实状态对齐一次(否则明明是开启的, 界面上却是没勾)。
+      if (!textPackInitialized) {
+        textPackInitialized = true;
+        box.checked = active;
+      }
+      box.title = (textPackState.message || "") + " · 本次开启将安装：" + (TEXTPACK_NAMES[target] || target) +
+        " · 只改客户端界面文字，不动局内文字";
     }
-    box.disabled = false;
-    // 勾选是"这次要不要一起开"的选项, 由用户掌握; 真实状态看下面那张状态卡。
-    // 但软件刚启动时要跟真实状态对齐一次(否则明明是开启的, 界面上却是没勾)。
-    if (!textPackInitialized) {
-      textPackInitialized = true;
-      box.checked = Boolean(textPackState.active);
-    }
-    box.title = (textPackState.message || "") + " · 目标语言：" + ({ en_us: "英文", ja_jp: "日文", ko_kr: "韩文", ru_ru: "俄文" }[locale] || locale) +
-      " · 只改客户端界面文字，不动局内文字";
-    const on = Boolean(textPackState.active && textPackState.staged === locale);
 
-    // 状态卡(与另外三格同款): 开了就点亮, 并写清目标语言与是否需要重启客户端
-    const names = { en_us: "英文", ja_jp: "日文", ko_kr: "韩文", ru_ru: "俄文" };
+    // 状态卡(与另外三格同款): 开了就点亮, 语言取实际已安装的那一个
     const card = $("cardStatusClientText");
-    if (card) card.classList.toggle("active", on);
+    if (card) card.classList.toggle("active", active);
     const tag = $("tagStatusClientText");
-    if (tag) tag.textContent = on ? "已开启" : "原版";
+    if (tag) tag.textContent = active ? "已开启" : "原版";
     const badge = $("statusClientText");
-    if (badge) badge.textContent = on ? "已开启" : "原版";
-    const cardEl = $("cardStatusClientText");
-    if (cardEl) {
-      cardEl.title = (textPackState.message || "") + (on
-        ? "目标语言：" + (names[locale] || locale) + (textPackState.clientRunning ? "（客户端正在运行，需重启后生效）" : "")
-        : "未开启，客户端界面为原版");
+    if (badge) badge.textContent = active ? "已开启" : "原版";
+    if (card) {
+      card.title = active
+        ? (textPackState.message || "") + "目标语言：" + (TEXTPACK_NAMES[staged] || staged || "未知") +
+          (textPackState.clientRunning ? "（客户端正在运行，需重启后生效）" : "")
+        : "未开启，客户端界面为原版";
     }
-  }
-
-  async function callTextPack(action, locale) {
-    const payload = await api("/api/textpack", { method: "POST", body: JSON.stringify({ action, locale }) });
-    renderTextPack(payload.state);
-    if (payload.message) log(payload.message);
-    return payload;
   }
 
   async function loadTextPack() {
@@ -576,13 +566,11 @@
     }
   }
 
-  /** 语音包换了语言时, 已开启的文字包跟着换过去(需要重启客户端才生效)。 */
-  async function syncTextPackLocale() {
-    if (!textPackState || !textPackState.active) return;
-    const target = textPackLocale();
-    if (!target || target === textPackState.staged) return;
-    await callTextPack("stage", target);
-  }
+  /**
+   * 注意: 这里**没有**"换语音包就顺手重装文字包"的联动。
+   * 以前在下拉栏里浏览别的语音包, 会立刻把客户端文字包 Stage 成新语言（要重启客户端才生效）——
+   * 用户只是看看, 客户端却已经被改了。现在文字包只在点『开启语音包』时按当次选择安装。
+   */
 
   /** 这次点"开启语音包"要不要一起开客户端界面文字(和另外三个勾选项一样, 只是个选项)。 */
   function clientTextSelected() {

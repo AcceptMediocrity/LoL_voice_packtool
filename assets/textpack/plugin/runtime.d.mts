@@ -19,6 +19,8 @@ export interface TextReplacerOptions {
   maxLength?: number;
   skipSelectors?: string[];
   storageKey?: string;
+  /** false = 不由本模块隐藏加载器界面(合并插件里由插件统一处理)。 */
+  hideLoaderUi?: boolean;
 }
 
 export interface TextReplacer {
@@ -26,6 +28,10 @@ export interface TextReplacer {
   readonly on: boolean;
   off(): string;
   on_(): string;
+  /** 换字典: 先还原旧译文, 再按新字典重扫。返回字典条数。 */
+  setDict(dict: Record<string, string>): number;
+  /** 把改过的文字还原成原文(关闭"客户端界面文字"用)。 */
+  revert(): string;
   stats(): { replaced: number; scanned: number; failed: number; error: string; collected: number };
   /** 导出没翻译到的中文清单。 */
   dump(): string[];

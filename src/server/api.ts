@@ -7,9 +7,16 @@ import { APP_NAME, APP_NAME_CN, APP_VERSION, API_VERSION } from "../version.ts";
 import { saveConfig, loadConfig, appRoot, configPath, type ConfigPatch } from "../core/config.ts";
 import { resolveVoiceRoot } from "../core/paths.ts";
 import { isDirectory, listNames } from "../core/fsx.ts";
-import { getState as getTextPackState, mergeCollected, restartClient as restartClientForTextPack, runElevated, stage as stageTextPack, unstage as unstageTextPack } from "../textpack/deploy.ts";
-import { isClientRunning } from "../core/win/processes.ts";
-import { lobbyVoiceEnabled } from "../modules/lobbyVoice.ts";
+import { getState as getTextPackState, mergeCollected, readRegistry, restartClient as restartClientForTextPack, runElevated, stage as stageTextPack, unstage as unstageTextPack } from "../textpack/deploy.ts";
+import { assertNoForeignLoader } from "../packs/loaderConflict.ts";
+import {
+  clientFeaturesInUse,
+  isClientPluginStaged,
+  readClientConfig,
+  stageClientPlugin,
+  writeClientConfig,
+  writeLangDict
+} from "../packs/clientPlugin.ts";
 import type { ModuleId } from "../core/types.ts";
 import { invalidateConfigCache } from "../core/config.ts";
 import { createLogger, setLogLevel, type LogLevel } from "../core/logger.ts";
@@ -33,13 +40,14 @@ function takeWindowShowRequest(): boolean {
 }
 
 /**
- * 加载器(core.dll + 那个注册表项)是"客户端界面文字"和"选人语音"**共用**的。
- * 只要选人语音还开着, 就不能把注册表项删掉 —— 删了插件就再也注入不进去,
- * 用户看到的就是"明明开启了却还是原声"(实际踩过)。
+ * 加载器(core.dll + 注册表项)是"客户端界面文字"和"选人语音"**共用**的。
+ * 两个功能现在是同一个插件里的两个开关; 只要还有一个开着, 就不能把激活项删掉,
+ * 否则插件再也注入不进去, 用户看到的就是"明明开启了却没效果"。
  */
-async function loaderInUseByVoice(): Promise<boolean> {
+async function loaderInUse(): Promise<boolean> {
   try {
-    return await lobbyVoiceEnabled();
+    const inUse = await clientFeaturesInUse();
+    return inUse.voice || inUse.text;
   } catch {
     return false;
   }
@@ -75,12 +83,13 @@ function asModules(value: unknown): ModuleId[] | undefined {
 }
 
 /**
- * 这些模块需要英雄联盟客户端在运行(选人语音必须连 LCU, 客户端没开就做不了)。
- * 对局语音/对局语言只改游戏文件, 不在此列。
+ * 客户端是否在运行**不再**决定能不能开启。
+ *
+ * 选人语音/界面文字现在是"预部署 + 客户端启动时注入": 客户端没开也能把文件和配置写好,
+ * 下次启动客户端自然生效(客户端开着时则会提示重启一次)。
+ * 对局语音/对局文字本来就只改游戏文件, 更不需要客户端。
+ * 所以这里不保留任何"未启动就拒绝"的分支 —— 只把 client_running 写进结果里说明何时生效。
  */
-function needsClient(modules: ModuleId[] | null | undefined): boolean {
-  return Array.isArray(modules) && modules.some((item) => item === "lobby_voice" || item === "lobby_lang");
-}
 
 export function buildRouter(): Router {
   const router = new Router();
@@ -192,22 +201,38 @@ export function buildRouter(): Router {
   router.post("/api/textpack", async (context) => {
     const body = asRecord(context.body);
     const action = String(body.action ?? "");
-    const locale = String(body.locale ?? "en_us");
+    const locale = String(body.locale ?? "en_us").trim().toLowerCase();
     if (action === "stage") {
+      // 部署加载器 + 单一插件 + 字典, 并把文字开关打开(激活仍是单独一步)
       const result = await stageTextPack(locale);
       return { ok: result.ok, message: result.message, state: await getTextPackState() };
     }
     if (action === "activate" || action === "deactivate") {
-      if (action === "deactivate" && (await loaderInUseByVoice())) {
-        const state = await getTextPackState();
-        return { ok: true, message: "选人语音还在用加载器，激活项保留", state };
+      if (action === "deactivate" && (await loaderInUse())) {
+        return { ok: true, message: "还有客户端功能在用加载器，激活项保留", state: await getTextPackState() };
+      }
+      if (action === "activate") {
+        const guard = await assertNoForeignLoader();
+        if (!guard.ok) return { ok: false, message: guard.message, state: await getTextPackState() };
       }
       const result = await runElevated(action === "activate" ? "install" : "uninstall");
       return { ok: result.ok, message: result.message, state: await getTextPackState() };
     }
     if (action === "unstage") {
-      const result = await unstageTextPack();
-      return { ok: result.ok, message: result.message, state: await getTextPackState() };
+      // 彻底移除: 先把文字开关关掉; 只关了文字的话不拆插件(选人语音还在用)。
+      await writeClientConfig({ text: { enabled: false } });
+      const inUse = await clientFeaturesInUse();
+      if (inUse.voice) {
+        return { ok: true, message: "选人语音还在用插件，已只关闭客户端界面文字", state: await getTextPackState() };
+      }
+      // 顺序不能反: 先撤注册表激活项, 再删文件。授权被取消就保留加载器文件, 免得客户端起不来。
+      const off = await runElevated("uninstall");
+      const result = await unstageTextPack({ keepLoader: !off.ok });
+      return {
+        ok: result.ok,
+        message: off.ok ? result.message : `${result.message}（激活项未撤销，加载器文件已保留）`,
+        state: await getTextPackState()
+      };
     }
     if (action === "restart") {
       const result = await restartClientForTextPack();
@@ -256,43 +281,37 @@ export function buildRouter(): Router {
     // 注意: asModules 会把空数组折成 undefined, 而 undefined 在这里的意思是"没指定, 全都要"。
     // 于是"只勾了客户端界面文字"会变成"顺手把对局语音/对局文字也切了" —— 用户实测踩到过。
     // 所以明确传了数组(哪怕是空的)就必须原样尊重。
-    let modules = Array.isArray(body.modules) ? asModules(body.modules) ?? [] : undefined;
-    // 设计约定: 只有勾选了"选人语音"才要求客户端在运行(它必须连 LCU);
-    // 对局语音/对局语言只改游戏文件, 客户端没开也能做。恢复原版不受任何限制。
-    //
-    // 这里**不整体拦截**: 以前客户端没开就直接返回 blocked, 用户勾着选人语音(默认就是勾着的)
-    // 时连"只改对局语音"都做不了, 界面上还只剩一句 TypeError。现在改成跳过它、其余照做。
-    let skippedClient = "";
-    if (needsClient(modules) && !(await isClientRunning())) {
-      const rest = (modules ?? []).filter((item) => item !== "lobby_voice" && item !== "lobby_lang");
-      if (rest.length === 0) {
-        return {
-          ok: false,
-          blocked: true,
-          message:
-            "英雄联盟未启动：只勾了选人语音，它需要客户端运行才能生效。请先启动客户端并登录到大厅；如果只想改对局语音，把『选人语音』的勾去掉即可。"
-        };
-      }
-      modules = rest;
-      skippedClient = "选人语音需要客户端运行，本次已跳过（对局语音/语言照常开启）";
-    }
-    // 客户端界面文字不是游戏模块: 它要装/卸注入器(各需要一次管理员授权), 所以在任务开始前
-    // 先做掉 —— 这样任务后面那次"重启客户端"正好能让注入生效。
+    const modules = Array.isArray(body.modules) ? asModules(body.modules) ?? [] : undefined;
+    // 客户端开不开都允许开启(选人语音/界面文字是预部署, 客户端下次启动生效)。
+    // 客户端界面文字不是游戏模块: 它只改插件配置(+第一次需要部署/激活),
+    // 所以在任务开始前先做掉 —— 这样任务后面那次"重启客户端"正好能让注入生效。
     // 这一步失败绝不能拖垮"开启语音包"本身: 授权被拒、文件被占用都要照常继续, 只记一条日志。
     const wantClientText = body.clientText === true;
     const clientTextLocale = typeof body.clientTextLocale === "string" ? body.clientTextLocale : "";
     try {
-      const textPackBefore = await getTextPackState();
-      if (wantClientText && !textPackBefore.active) {
-        const staged = await stageTextPack(clientTextLocale || locale.toLowerCase());
-        // 提权跑 install.cmd: 它除了写注册表, 还会关掉正在运行的客户端(注入只在启动时发生)。
-        // 关闭放在脚本里是因为它已经提权, 从我们这边普通权限 taskkill 未必杀得动 WeGame 启动的客户端。
-        if (staged.ok) await runElevated("install");
-      } else if (!wantClientText && textPackBefore.staged) {
-        const keepLoader = await loaderInUseByVoice();
-        if (!keepLoader) await runElevated("uninstall");
-        else logger.info("选人语音还在用加载器，保留激活项与 core.dll");
-        await unstageTextPack({ keepLoader });
+      const textLocale = (clientTextLocale || locale).toLowerCase();
+      const pluginConfig = await readClientConfig();
+      if (wantClientText) {
+        let ready = await isClientPluginStaged();
+        if (!ready) {
+          // 第一次: 部署加载器 + 单一插件 + 字典(写入 config 里 text 开关)
+          const staged = await stageTextPack(textLocale);
+          ready = staged.ok;
+          if (!staged.ok) logger.warn(`客户端界面文字没部署成功: ${staged.message}`);
+        } else if (!pluginConfig.text.enabled || pluginConfig.text.locale !== textLocale) {
+          // 插件已就位: 只换字典 + 打开文字开关(不需要重装, 也不需要再动注册表)
+          await writeLangDict(textLocale);
+          await writeClientConfig({ text: { enabled: true, locale: textLocale } });
+        }
+        // 已经就位但激活项被撤过(比如用户手动取消过授权): 补一次激活
+        if (ready && (await readRegistry()) !== "set") {
+          const guard = await assertNoForeignLoader();
+          if (guard.ok) await runElevated("install");
+          else logger.warn(guard.message);
+        }
+      } else if (pluginConfig.text.enabled) {
+        // 不勾就关掉文字开关; 插件会自己把页面文字还原, 不用删任何文件、也不用重启
+        await writeClientConfig({ text: { enabled: false } });
       }
     } catch (error) {
       logger.warn("客户端界面文字这一步没做成(不影响语音包): " + String((error as Error).message).slice(0, 120));
@@ -305,7 +324,7 @@ export function buildRouter(): Router {
       restartClient: typeof body.restartClient === "boolean" ? body.restartClient : undefined,
       lobbyLang: body.lobbyLang === "en_US" || body.lobbyLang === "zh_CN" ? body.lobbyLang : "keep"
     });
-    return skippedClient ? { ok: true, task, warning: skippedClient } : { ok: true, task };
+    return { ok: true, task };
   });
 
   /** 页面看到 window_show=true 就让外壳把窗口亮出来(读一次就清掉, 一次性)。 */
@@ -346,22 +365,24 @@ export function buildRouter(): Router {
   });
 
   router.post("/api/restore", async (context) => {
-    // "恢复原版"要把它也还原: 先取消激活(删注册表项, 需要管理员), 再删掉我们放进去的文件。
-    // 顺序不能反 —— 先删文件的话注册表还指着不存在的 core.dll, 客户端会启动不了。
+    // "恢复原版"要把它也还原: 先关文字开关(插件会自己还原页面文字), 再让任务去还原语音/局内补丁。
+    // 加载器激活项由任务结束后的 rollbackLoaderIfIdle 统一处理 —— 两个功能都关了才撤,
+    // 不会出现"先删 core.dll、注册表还指着它"导致客户端起不来的情况。
     let removedTextPack = false;
-    const textPack = await getTextPackState();
-    if (textPack.staged) {
-      const keepLoader = await loaderInUseByVoice();
-      if (!keepLoader) await runElevated("uninstall");
-      else logger.info("选人语音还在用加载器，保留激活项与 core.dll");
-      await unstageTextPack({ keepLoader });
-      removedTextPack = true;
-      logger.info("恢复原版: 客户端界面文字已还原" + (keepLoader ? "（加载器保留给选人语音）" : ""));
+    try {
+      const config = await readClientConfig();
+      if (config.text.enabled) {
+        await writeClientConfig({ text: { enabled: false } });
+        removedTextPack = true;
+        logger.info("恢复原版: 客户端界面文字已关闭");
+      }
+    } catch (error) {
+      logger.warn("恢复原版: 关闭客户端界面文字失败 " + String((error as Error).message).slice(0, 120));
     }
     const body = asRecord(context.body);
     const task = startRestoreTask({
       modules: asModules(body.modules),
-      // 撤过文字包就要重启客户端: 运行中的客户端里注入器还挂着, 不重启等于没还原。
+      // 撤过文字就要重启客户端: 运行中的页面里还挂着替换后的文字, 重启后最干净。
       clientText: removedTextPack,
       restartClient: typeof body.restartClient === "boolean" ? body.restartClient : undefined,
     });
@@ -373,13 +394,7 @@ export function buildRouter(): Router {
     const config = await loadConfig();
     const locale = typeof body.locale === "string" && body.locale ? body.locale : config.defaultLocale;
     const oneClickModules = asModules(body.modules) ?? ["lobby_voice", "ingame_voice", "ingame_lang"];
-    if (needsClient(oneClickModules) && !(await isClientRunning())) {
-      return {
-        ok: false,
-        blocked: true,
-        message: "英雄联盟未启动：一键开启包含选人语音，请先启动客户端并登录到大厅"
-      };
-    }
+    // 一键开启也不要求客户端在运行: 选人语音/界面文字是预部署, 客户端下次启动生效。
     const task = startApplyTask({
       locale,
       modules: oneClickModules,

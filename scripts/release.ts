@@ -17,7 +17,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 /** 版本号: 发布就改这里(文件夹名跟着变)。 */
-const VERSION = "1.22";
+const VERSION = "1.23";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -74,6 +74,18 @@ for (const name of await fs.readdir(dstPack).catch(() => [] as string[])) {
   cleaned += 1;
 }
 if (cleaned) console.log("清理过期的文字包目录: " + cleaned + " 个");
+
+// 2c) 旧的"每个语种一个插件"(assets/textpack/<语种>/plugin)已经废弃:
+//     现在只有一个客户端插件 assets/client-plugin。这些生成物每份 2~3 MB, 不往发布包里带,
+//     免得发布包白白大 10 MB, 也免得用户/以后的人以为还有第二份插件。
+let dropped = 0;
+for (const name of await fs.readdir(dstPack).catch(() => [] as string[])) {
+  const legacy = path.join(dstPack, name, "plugin");
+  if (!(await exists(legacy))) continue;
+  await fs.rm(legacy, { recursive: true, force: true }).catch(() => undefined);
+  dropped += 1;
+}
+if (dropped) console.log("清理已废弃的每语种插件目录: " + dropped + " 个");
 
 // 3) 窗口外壳 → resource/desktop/
 const built = (await exists(path.join(root, "desktop", "target", "release", "voice-shell.exe")))

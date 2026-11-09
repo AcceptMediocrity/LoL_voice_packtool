@@ -3,7 +3,7 @@ import { createLogger } from "../core/logger.ts";
 import { summarize, type ModuleResult, type ResultSummary } from "../core/result.ts";
 import type { ModuleId, ProgressReporter } from "../core/types.ts";
 import { isClientRunning, isGameRunning } from "../core/win/processes.ts";
-import { restartClientUx, waitForClientUp } from "../core/win/lcu.ts";
+import { restartClientUx, waitForClientHealthy, waitForClientUp } from "../core/win/lcu.ts";
 import { countPendingRestores } from "../packs/inventory.ts";
 import { langSources, voiceGroups } from "../packs/wad.ts";
 import { applyIngameLang, restoreIngameLang } from "./ingameLang.ts";
@@ -131,18 +131,50 @@ export async function applyAll(env: SwitchEnv, options: RunOptions): Promise<Run
 
   const summary = summarize(results);
   let restarted = false;
+  let startupFailure = "";
   if ((options.clientText === true || modules.length > 0) && options.restartClient !== false && (await isClientRunning())) {
     const restart = await restartClientUx();
     restarted = restart.ok;
-    if (restarted) await waitForClientUp(90000);
+    if (restarted) {
+      // 不只等进程: 注入不兼容/被反作弊拦住时, 进程可能起来又崩, 或者卡在加载。
+      // 拿不到 LCU 响应就判定启动失败, 自动撤销注入 —— 不能让用户只剩一个进不去的客户端。
+      const health = await waitForClientHealthy(90000);
+      if (!health.ok) {
+        startupFailure = health.reason;
+        logger.warn(`客户端重启后没有正常启动: ${health.reason}，正在撤销客户端注入…`);
+        try {
+          const { shutDownClientFeatures } = await import("./shutdown.ts");
+          const rolled = await shutDownClientFeatures("客户端启动失败", {
+            clientRunning: async () => false,
+            gameRunning: async () => false
+          });
+          for (const note of rolled.notes) logger.warn(`撤销注入: ${note}`);
+        } catch (error) {
+          logger.warn(`撤销注入失败: ${String((error as Error).message ?? error)}`);
+        }
+      }
+    }
   }
   options.progress?.(total, total);
+  if (startupFailure) {
+    return {
+      ok: false,
+      partial: summary.partial,
+      restarted,
+      message:
+        `已切换文件，但客户端没有正常启动：${startupFailure}。\n` +
+        `已自动撤销客户端注入（选人语音 / 客户端界面文字），局内补丁保留，可点『恢复原版』还原。\n` +
+        `请把 %LOCALAPPDATA%\\LoL_Voice\\app.log 发给我们定位。`,
+      summary,
+      results
+    };
+  }
   return {
     ok: summary.ok,
     partial: summary.partial,
     restarted,
     message: summary.ok
-      ? `已切换到 ${options.locale}${restarted ? "，客户端正在自动重启生效…" : "，启动客户端后生效。"}`
+      ? `已切换到 ${options.locale}${restarted ? "，客户端已重启并连上。" : "，启动客户端后生效。"}`
       : (summary.partial ? "部分成功：" : "切换失败：") + summary.lines.join("；"),
     summary,
     results

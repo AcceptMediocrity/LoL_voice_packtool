@@ -14,12 +14,16 @@ import { startApiServer } from "./server/api.ts";
 const logger = createLogger("app");
 
 /**
- * 退出 = 还原(用户要求: 关掉软件就相当于点了"恢复原版")。
+ * 退出清理: 关掉软件 = 关掉两个"客户端内"功能, 并重启客户端让它生效。
  *
- * 只清理**选人语音**这套实时功能, 不动已经写进游戏目录的补丁文件:
- *   1. 停掉 LCU 监听
- *   2. 把客户端"播放选择语音/播放禁用语音"两栏还原成开启(选人期间才由工具静音)
- *   3. 清掉 ui.lastApplied —— 下次打开显示"未开启", 也不会自己开起来
+ *   1. 对局前选人语音: 关插件开关 + 拆掉语音资源挂载;
+ *   2. 客户端界面文字: 移除文字插件与语言标记;
+ *   3. 两个都不用加载器时, 撤掉注册表激活项;
+ *   4. 以上有任何改动且客户端在运行 -> 重启一次客户端;
+ *   5. 清掉 ui.lastApplied —— 下次打开显示"未开启", 也不会自己开起来。
+ *
+ * **局内语音 / 局内文字是写进游戏目录的补丁文件, 这里绝不动**:
+ * 那是用户这次"开启语音包"的结果, 要还原请点界面上的『恢复原版』。
  */
 
 /**
@@ -41,14 +45,15 @@ async function healStaleLoader(reason: string): Promise<void> {
 }
 
 async function cleanupOnExit(): Promise<void> {
+  // 只关"客户端内"的两个功能(选人语音 / 客户端界面文字), 局内补丁一律不动。
   try {
-    const { setClientOriginalVoice } = await import("./modules/clientVoice.ts");
-    await setClientOriginalVoice(false, "tool");
+    const { shutDownClientFeatures } = await import("./modules/shutdown.ts");
+    const result = await shutDownClientFeatures("退出清理");
+    for (const note of result.notes) logger.info(`退出清理: ${note}`);
+    if (!result.changed) logger.info("退出清理: 选人语音与客户端界面文字都未开启，无需处理");
   } catch (error) {
-    logger.warn(`退出清理: 还原客户端原版台词失败(${String((error as Error).message ?? error)})`);
+    logger.warn(`退出清理: 关闭选人语音/客户端界面文字失败(${String((error as Error).message ?? error)})`);
   }
-  // 关掉软件 = 回到原版: 加载器激活项也必须一起撤掉, 否则客户端下次起不来
-  await healStaleLoader("退出清理");
 
   try {
     const config = await loadConfig();
